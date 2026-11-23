@@ -1,4 +1,4 @@
-# hpc-tools
+# farm-tools
 
 Small terminal tools for working on the LSF farm over ssh. They are
 plain bash and Python 3 scripts (standard library only), they call no web services, and they only
@@ -13,8 +13,8 @@ seconds. Just type `bjpick` in any terminal.
 ## Quick start (on the farm)
 
 ```bash
-git clone https://github.com/<you>/hpc-tools ~/hpc-tools
-cd ~/hpc-tools
+git clone https://github.com/caganlab/farm-tools ~/farm-tools
+cd ~/farm-tools
 ./install.sh --deps
 ```
 
@@ -30,7 +30,7 @@ bjpick          # the jobs picker; Esc closes, Enter follows a job's logs
 bq -x -m 8G -t 2h -- echo hi    # dry run: shows the bsub command it would submit
 ```
 
-Every tool has `-h`. Updating is `git pull` in `~/hpc-tools` (the installed commands are links, so
+Every tool has `-h`. Updating is `git pull` in `~/farm-tools` (the installed commands are links, so
 they update with it). `./install.sh --uninstall` removes the links. The installer never overwrites a
 command you already have with the same name; it tells you and skips it. Set `PREFIX=/some/dir` to
 install somewhere other than `~/.local/bin`.

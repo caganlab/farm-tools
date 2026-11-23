@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# bjpick: pick one of your LSF jobs with fzf and follow its logs live.
+# Bound to Alt b in zellij (floating pane). Jobs submitted from the current directory come first,
+# then running, pending, failed and done (bjobs keeps finished jobs for about an hour).
+#
+# The preview is live: the job card (origin, time vs limit, memory, CPU, command, exit or
+# pending reason; time ticks live, memory/CPU are LSF's own samples) plus the tails of
+# stdout and stderr, redrawn every BJPICK_TICK seconds (default 2); the list itself reloads
+# every 30 s so states stay current.
+#
+#   enter      follow the job's stdout+stderr full-screen (bjstat JOBID -F); Ctrl-C returns here
+#   ctrl-k     preview: card only       ctrl-l   preview: card + live logs (default)
+#   alt-enter  full card incl. files written, in a pager
+#   ctrl-r     reload the list now      ctrl-/   preview on/off      esc   close
+#
+# bjpick only reads; it never kills or changes jobs. The live refresh talks to fzf over a
+# localhost port protected by a random key (FZF_API_KEY), so other users can't drive it.
+
+set -u
+SELF=$(readlink -f "$0")
+HERE=$(pwd -P)
+
+list() {
+  # id  state  queue  cores  name  dir   (tab-separated; first column hidden key). No runtime: the lines must
+  # stay identical between reloads so --track keeps the cursor on the same job.
+  bjobs -a -noheader -o "jobid jobindex stat job_name run_time exec_cwd sub_cwd queue nreq_slot delimiter='|'" 2>/dev/null \
+  | awk -F'|' -v here="$HERE" -v home="$HOME" '
+      function rank(s) { return s=="RUN"?1 : s=="PEND"?2 : s=="EXIT"?3 : s=="DONE"?4 : 5 }
+      function hdur(s,  t) { t=s+0; if (t<60) return t "s"; if (t<3600) return int(t/60) "m";
+                             if (t<86400) return int(t/3600) "h" int((t%3600)/60) "m"; return int(t/86400) "d" int((t%86400)/3600) "h" }
+      {
+        id=$1; if ($2!="0" && $2!="") id=id "[" $2 "]"
+        dir=($6!="" && $6!="-") ? $6 : $7; gsub(/\$HOME/, home, dir)
+        h=(dir==here || index(dir, here "/")==1) ? 0 : 1
+        sd=dir; sub(/.*\/users\/[^\/]+\//, "", sd); sub(home, "~", sd)
+        col = $3=="RUN"?"\033[32m" : $3=="PEND"?"\033[33m" : $3=="EXIT"?"\033[31m" : "\033[2m"
+        mark = h==0 ? "\033[36m●\033[0m" : " "
+        q = ($8=="normal") ? "\033[2mnormal   \033[0m" : sprintf("\033[35m%-9s\033[0m", substr($8,1,9))
+        n = ($9+0 > 0) ? $9 : "?"
+        cores = (n=="1") ? sprintf("\033[2m%4s\033[0m", "1c") : sprintf("%4s", n "c")
+        printf "%d%d%012d\t%s\t%s %-14s %s%-5s\033[0m %s %s  %-30s \033[2m%s\033[0m\n",
+               h, rank($3), 999999999999-$1, id, mark, id, col, $3, q, cores, substr($4,1,30), sd
+      }' \
+  | sort -t$'\t' -k1,1 | cut -f2-
+}
+
+case "${1:-}" in
+  __list) list; exit ;;
+  __follow)
+    clear
+    bjstat "$2" -F -n 30
+    printf '\n\033[2m(any key: back to the list)\033[0m'; read -rsn1 < /dev/tty; exit ;;
+  __card) BJSTAT_COLOR=1 bjstat "$2" -n 25 | less -R; exit ;;
+  __ticker)   # $2 = fzf pid; FZF_PORT and FZF_API_KEY come from fzf's environment
+    tick=${BJPICK_TICK:-2}; n=0
+    post() { curl -s --noproxy "*" -m 2 -X POST -H "x-api-key: $FZF_API_KEY" "http://localhost:$FZF_PORT" -d "$1" >/dev/null 2>&1; }
+    while kill -0 "$2" 2>/dev/null; do
+      sleep "$tick"; n=$((n + 1))
+      if (( n * tick >= 30 )); then n=0; post "reload-sync('$SELF' __list)"; fi
+      post "refresh-preview"
+    done
+    exit ;;
+  -h|--help) sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit ;;
+esac
+
+# Inside zellij, grow our own floating pane (keybinding Run can't set a size in 0.42).
+# BJPICK_GEOM="x y width height" overrides; does nothing for tiled panes or outside zellij.
+if [[ -n ${ZELLIJ_PANE_ID:-} ]]; then
+  read -r gx gy gw gh <<< "${BJPICK_GEOM:-2% 3% 96% 92%}"
+  zellij action change-floating-pane-coordinates --pane-id "terminal_$ZELLIJ_PANE_ID" \
+    -x "$gx" -y "$gy" --width "$gw" --height "$gh" >/dev/null 2>&1
+  sleep 0.15   # let the resize land before fzf measures the terminal
+fi
+
+if [[ -z $(list | head -1) ]]; then
+  echo "no jobs in bjobs (it keeps finished ones for about an hour)"
+  read -rsn1 -t 5 < /dev/tty; exit 0
+fi
+
+export FZF_API_KEY=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+LIVE="BJSTAT_COLOR=1 bjstat {1} --peek \$FZF_PREVIEW_LINES \$FZF_PREVIEW_COLUMNS"
+CARD="BJSTAT_COLOR=1 bjstat {1} --compact --no-files"
+list | fzf --ansi --no-sort --reverse --track --delimiter=$'\t' --with-nth=2 \
+    --listen-unsafe \
+    --header="● = from $(basename "$HERE") · preview: card + live logs · enter follow full-screen · ctrl-k card only / ctrl-l card+logs · alt-enter full card · esc close" \
+    --preview="$LIVE" \
+    --preview-window='down,70%,border-top,wrap' \
+    --bind="start:execute-silent(setsid '$SELF' __ticker \$PPID >/dev/null 2>&1 < /dev/null &)" \
+    --bind="enter:execute('$SELF' __follow {1})+reload-sync('$SELF' __list)" \
+    --bind="alt-enter:execute('$SELF' __card {1})" \
+    --bind="ctrl-k:change-preview($CARD)" \
+    --bind="ctrl-l:change-preview($LIVE)" \
+    --bind="ctrl-r:reload-sync('$SELF' __list)" \
+    --bind="ctrl-p:refresh-preview" \
+    --bind="ctrl-/:toggle-preview" > /dev/null
+exit 0

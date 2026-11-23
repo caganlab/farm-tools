@@ -1,0 +1,1699 @@
+#!/usr/bin/env python3
+"""bjstat — a friendlier summary of your LSF jobs.
+
+Usage:
+  bjstat                 summary
+  bjstat -l              also list every active job with its ETA
+  bjstat -J 'tsb*'       only jobs whose name matches a glob
+  bjstat -w 60           refresh every 60 s (Ctrl-C to quit)
+  bjstat -u someone      look at another user's jobs
+  bjstat -f myproject    only jobs submitted from a dir / Claude session matching
+  bjstat -f here         only jobs from this dir or this Claude Code session
+  bjstat --explain       glossary of LSF states/terms and what the columns mean
+  bjstat JOBID           everything about one job: resources vs request, logs (tail),
+                         files it has written and where, exit diagnosis (bjstat JOBID -h)
+  bjstat JOBID -F        follow one job's stdout+stderr live until it finishes
+
+Output sections:
+  headline        running / pending / done / failed / killed-by-you counts,
+                  cores in use, RAM in use vs reserved
+  Waiting         age of your oldest active job, how long pending jobs have
+                  waited, how long started jobs sat in the queue first
+  By job group    counts, median runtime, finishes/hour and ETA per group
+                  (jobs grouped by the name before the first '.'; see -g)
+  Why pending     LSF pend reasons in plain words, each with a tip
+  Needs attention jobs that can never start (with a bkill line), failures
+                  with exit code + log path, jobs near memory/run limits
+  Where from      submit directory and the Claude Code session (title, id,
+                  live/ended) that submitted each set of jobs
+  Resource use    memory and CPU actually used by finished jobs vs requested,
+                  with a smaller -M / -n suggestion where it's clearly too high
+  Queues          how busy each queue you use is across the cluster, with a
+                  bswitch suggestion when a much quieter queue exists
+
+ETAs are rough: (time left on running jobs + pending x group median runtime)
+/ jobs running now. ~ estimate, >= lower bound, <= only the run limit is known.
+
+bjstat only reads LSF (bjobs, bqueues); it never kills, moves or changes jobs.
+Suggested commands are printed for you to run. bjobs forgets finished jobs
+after about an hour, so done/failed counts and runtimes cover only that window.
+See 'man bjstat' for the full description.
+"""
+import argparse
+import fnmatch
+import json
+import math
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from glob import glob
+from datetime import datetime
+
+FIELDS = ("jobid jobindex stat queue job_name submit_time start_time finish_time "
+          "run_time runtimelimit pend_reason pend_time slots max_mem mem memlimit "
+          "cpu_used exit_code exit_reason dependency output_file error_file sub_cwd nreq_slot")
+
+USE_COLOR = (sys.stdout.isatty() or os.environ.get("BJSTAT_COLOR") == "1") and os.environ.get("NO_COLOR") is None
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else str(text)
+
+
+def bold(t): return c(t, "1")
+def dim(t): return c(t, "2")
+def red(t): return c(t, "31")
+def green(t): return c(t, "32")
+def yellow(t): return c(t, "33")
+def cyan(t): return c(t, "36")
+
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def vlen(s):
+    return len(ANSI.sub("", str(s)))
+
+
+def table(rows, header, align=None):
+    cols = len(header)
+    align = align or ["<"] + [">"] * (cols - 1)
+    widths = [max(vlen(r[i]) for r in [header] + rows) for i in range(cols)]
+    out = []
+    for r in [header] + rows:
+        cells = []
+        for i, v in enumerate(r):
+            pad = " " * (widths[i] - vlen(v))
+            cells.append(f"{v}{pad}" if align[i] == "<" else f"{pad}{v}")
+        out.append("  " + "  ".join(cells).rstrip())
+    out.insert(1, "  " + "  ".join("-" * w for w in widths))
+    out[0] = bold(out[0])
+    return "\n".join(out)
+
+
+# ---------- parsing ----------
+
+def run_json(cmd):
+    env = dict(os.environ, LSB_DISPLAY_YEAR="Y")
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    except FileNotFoundError:
+        sys.exit(f"bjstat: {cmd[0]} not found — are you on an LSF head node?")
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return {"RECORDS": []}
+
+
+def parse_time(s):
+    if not s:
+        return None
+    s = re.sub(r"\s+[LEX]$", "", s.strip())
+    for fmt in ("%b %d %H:%M:%S %Y", "%b %d %H:%M %Y"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
+def parse_secs(s):
+    m = re.match(r"([\d.]+)", s or "")
+    return float(m.group(1)) if m else None
+
+
+MEM_UNITS = {"K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1, "T": 1024}
+
+
+def parse_mem_gb(s):
+    m = re.match(r"([\d.]+)\s*([KMGT])", s or "", re.I)
+    return float(m.group(1)) * MEM_UNITS[m.group(2).upper()] if m else None
+
+
+def group_key(name, mode):
+    base = re.sub(r"\[\d+\]$", "", name)
+    if mode == "name":
+        return base
+    base = base.rstrip("/").rsplit("/", 1)[-1]          # paths -> basename
+    if mode == "prefix":
+        if "." in base and not base.startswith("."):
+            return base.split(".", 1)[0]
+        return re.sub(r"\d+", "#", base)                 # nrCaeEleg93_x -> nrCaeEleg#_x
+    return base
+
+
+def load_jobs(user, pattern, group_mode):
+    cmd = ["bjobs", "-a", "-json", "-o", FIELDS]
+    cmd += ["-u", user] if user else []
+    recs = run_json(cmd).get("RECORDS", [])
+    now = time.time()
+    jobs = []
+    for r in recs:
+        if r.get("ERROR"):
+            continue
+        name = r.get("JOB_NAME", "")
+        if pattern and not fnmatch.fnmatch(name, pattern) \
+                and not fnmatch.fnmatch(name.rsplit("/", 1)[-1], pattern):
+            continue
+        idx = r.get("JOBINDEX", "0")
+        j = {
+            "id": r["JOBID"] + (f"[{idx}]" if idx not in ("", "0") else ""),
+            "stat": r.get("STAT", "?"),
+            "queue": r.get("QUEUE", ""),
+            "name": name,
+            "group": group_key(name, group_mode),
+            "submit": parse_time(r.get("SUBMIT_TIME")),
+            "start": parse_time(r.get("START_TIME")),
+            "finish": parse_time(r.get("FINISH_TIME")) if r.get("STAT") in ("DONE", "EXIT") else None,
+            "run": parse_secs(r.get("RUN_TIME")) or 0.0,
+            "limit": (parse_secs(r.get("RUNTIMELIMIT")) or 0) * 60 or None,
+            "pend_reason": (r.get("PEND_REASON") or "").rstrip(";").strip(),
+            "pend_time": parse_secs(r.get("PEND_TIME")),
+            "slots": int(parse_secs(r.get("SLOTS")) or 1),
+            "nreq": int(parse_secs(r.get("NREQ_SLOT")) or 1),
+            "max_mem": parse_mem_gb(r.get("MAX_MEM")),
+            "mem": parse_mem_gb(r.get("MEM")),
+            "memlimit": parse_mem_gb(r.get("MEMLIMIT")),
+            "cpu": parse_secs(r.get("CPU_USED")),
+            "exit_code": r.get("EXIT_CODE", ""),
+            "exit_reason": r.get("EXIT_REASON", ""),
+            "dependency": r.get("DEPENDENCY", ""),
+            "out": r.get("OUTPUT_FILE", ""),
+            "err": r.get("ERROR_FILE", ""),
+            "cwd": r.get("SUB_CWD", ""),
+        }
+        if j["stat"] == "EXIT" and "TERM_OWNER" in j["exit_reason"]:
+            j["stat"] = "KILLED"          # you bkilled it: not a failure
+        if j["stat"] == "PEND" and j["submit"]:
+            j["waiting"] = now - j["submit"]
+        jobs.append(j)
+    return jobs
+
+
+# ---------- formatting helpers ----------
+
+def dur(s):
+    if s is None or (isinstance(s, float) and math.isnan(s)):
+        return "-"
+    s = int(max(s, 0))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s" if s < 600 else f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+
+def dur_s(s):
+    """Like dur, but always to the second (for the live preview)."""
+    s = int(max(s or 0, 0))
+    h, m, sec = s // 3600, (s % 3600) // 60, s % 60
+    if s >= 86400:
+        return f"{s // 86400}d{h % 24:02d}h{m:02d}m{sec:02d}s"
+    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s"
+
+
+def when(ts):
+    if ts is None:
+        return "-"
+    d = datetime.fromtimestamp(ts)
+    today = datetime.now().date()
+    return d.strftime("%H:%M") if d.date() == today else d.strftime("%a %d %b %H:%M")
+
+
+def pct(vals, q):
+    vals = sorted(vals)
+    if not vals:
+        return None
+    k = (len(vals) - 1) * q
+    lo, hi = math.floor(k), math.ceil(k)
+    return vals[lo] + (vals[hi] - vals[lo]) * (k - lo)
+
+
+def gb(x):
+    if x is None:
+        return "-"
+    return f"{x:.0f}G" if x >= 10 else f"{x:.1f}G" if x >= 0.1 else f"{x * 1024:.0f}M"
+
+
+DEAD_DEP = "never satisfied"
+SHORT_REASONS = [
+    (r"Dependency condition invalid or never satisfied", "dependency can NEVER be met"),
+    (r"Job dependency condition not satisfied", "waiting on dependency"),
+    (r"queue has reached its job slot limit \(Queue: (\S+?),", r"queue \1 full"),
+    (r"Job slot limit reached", "no free slots on eligible hosts"),
+    (r"specified start time", "has a -b start time"),
+    (r"user has reached .*limit|User has reached", "you hit your per-user limit"),
+    (r"Not enough hosts|not enough .*memory|Not enough processors", "waiting for big enough host"),
+    (r"suspended by .*user", "held by you (bstop/bresume)"),
+    (r"New job is waiting for scheduling", "just submitted"),
+]
+
+
+def short_reason(r):
+    for pat, rep in SHORT_REASONS:
+        m = re.search(pat, r, re.I)
+        if m:
+            return m.expand(rep)
+    return r[:70] or "(none given)"
+
+
+# ---------- where jobs came from ----------
+
+CACHE_DIR = os.path.expanduser("~/.cache/bjstat")
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+
+
+def _load_cache(name):
+    try:
+        with open(os.path.join(CACHE_DIR, name)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_cache(name, data):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = os.path.join(CACHE_DIR, name + f".{os.getpid()}")
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, os.path.join(CACHE_DIR, name))
+    except OSError:
+        pass
+
+
+def job_env_origin(jobid):
+    """Agent markers from the job's submission environment (bjobs -env, one job per call)."""
+    try:
+        out = subprocess.run(["bjobs", "-env", jobid], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    env = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k in ("CLAUDE_CODE_SESSION_ID", "AI_AGENT", "CLAUDECODE"):
+            env[k] = v.strip()
+    if not out.strip():
+        return None                      # no answer (job gone / not allowed): don't cache
+    return {"sid": env.get("CLAUDE_CODE_SESSION_ID", ""),
+            "agent": env.get("AI_AGENT", "") or ("claude-code" if env.get("CLAUDECODE") else "")}
+
+
+def live_sessions():
+    """sessionId -> registry entry for Claude Code sessions whose process is still alive."""
+    live = {}
+    for f in glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+            pid = int(d.get("pid") or os.path.basename(f).split(".")[0])
+        except (OSError, ValueError):
+            continue
+        if d.get("sessionId") and os.path.exists(f"/proc/{pid}"):
+            live[d["sessionId"]] = d
+    return live
+
+
+def session_title(path):
+    """Latest custom (/rename) or AI title and the first cwd in a session transcript."""
+    custom = ai = cwd = None
+    try:
+        with open(path, "rb") as fh:
+            for line in fh:
+                if cwd is None and b'"cwd"' in line:
+                    m = re.search(rb'"cwd":"((?:[^"\\]|\\.)*)"', line)
+                    if m:
+                        cwd = m.group(1).decode(errors="replace")
+                if b'-title"' in line:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if d.get("type") == "custom-title":
+                        custom = d.get("customTitle")
+                    elif d.get("type") == "ai-title":
+                        ai = d.get("aiTitle")
+    except OSError:
+        pass
+    return custom or ai, cwd
+
+
+def resolve_sessions(sids):
+    """sessionId -> {title, cwd, live, status, name}."""
+    live = live_sessions()
+    cache = _load_cache("sessions.json")
+    out = {}
+    for sid in sids:
+        info = {"title": None, "cwd": None, "live": sid in live, "status": "", "name": ""}
+        if sid in live:
+            info.update(cwd=live[sid].get("cwd"), status=live[sid].get("status", ""),
+                        name=live[sid].get("name", ""))
+        paths = glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{sid}.jsonl"))
+        if paths:
+            p = paths[0]
+            mt = os.path.getmtime(p)
+            c_ = cache.get(sid)
+            if c_ and c_.get("mtime") == mt:
+                title, cwd = c_["title"], c_["cwd"]
+            else:
+                title, cwd = session_title(p)
+                cache[sid] = {"mtime": mt, "title": title, "cwd": cwd}
+            info["title"] = title
+            info["cwd"] = info["cwd"] or cwd
+            info["last"] = mt
+        out[sid] = info
+    _save_cache("sessions.json", cache)
+    return out
+
+
+def add_origins(jobs, other_user=False):
+    """Attach j['sid'], j['agent'] and j['session'] (resolved info) to each job."""
+    cache = _load_cache("origins.json")
+    key = lambda j: f"{j['id'].split('[')[0]}@{int(j['submit'] or 0)}"
+    todo = sorted({j["id"].split("[")[0] for j in jobs if key(j) not in cache})
+    if todo:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            res = dict(zip(todo, ex.map(job_env_origin, todo)))
+        for j in jobs:
+            r = res.get(j["id"].split("[")[0])
+            if r is not None:
+                cache[key(j)] = r
+        week_ago = time.time() - 30 * 86400
+        cache = {k: v for k, v in cache.items() if int(k.rsplit("@", 1)[1]) > week_ago}
+        _save_cache("origins.json", cache)
+    for j in jobs:
+        o = cache.get(key(j)) or {}
+        j["sid"], j["agent"] = o.get("sid", ""), o.get("agent", "")
+    sids = {j["sid"] for j in jobs if j["sid"]}
+    sess = {} if other_user else resolve_sessions(sids)
+    for j in jobs:
+        j["session"] = sess.get(j["sid"], {})
+
+
+def short_dir(path):
+    if not path:
+        return "?"
+    m = re.search(r"/users/[^/]+/(.+)$", path)
+    if m:
+        return m.group(1)
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    parts = path.rstrip("/").split("/")
+    return "/".join(parts[-2:]) if len(parts) > 2 else path
+
+
+def origin_label(j, width=38):
+    """Short human label for where a job came from."""
+    if not j.get("sid"):
+        return "agent (no session id)" if j.get("agent") else "terminal / script"
+    info = j.get("session") or {}
+    title = info.get("title") or info.get("name") or "untitled session"
+    return f"{title[:width]} ({j['sid'][:8]})"
+
+
+def origin_state(j):
+    info = j.get("session") or {}
+    if not j.get("sid"):
+        return ""
+    if info.get("live"):
+        st = info.get("status") or "live"
+        return green(f"live, {st}") if st != "busy" else cyan("live, busy")
+    return dim("ended")
+
+
+# ---------- guidance ----------
+
+# queues that are reasonable to bswitch ordinary batch jobs between
+GENERAL_QUEUES = tuple(os.environ.get("BJSTAT_QUEUES", "normal long week basement").split())
+
+
+def load_queues():
+    out = {}
+    for q in run_json(["bqueues", "-json", "-o",
+                       "queue_name max_runlimit max pend run status"]).get("RECORDS", []):
+        out[q["QUEUE_NAME"]] = {
+            "pend": int(q.get("PEND") or 0), "run": int(q.get("RUN") or 0),
+            "max": int(q["MAX"]) if (q.get("MAX") or "").isdigit() else None,
+            "limit": (parse_secs(q.get("MAX_RUNLIMIT")) or 0) * 60 or None,
+            "status": q.get("STATUS", ""),
+        }
+    return out
+
+
+def backlog(q):
+    """pending per running slot; a queue sitting at its MAX counts as at least 1."""
+    r = q["run"] or 1
+    ratio = q["pend"] / r
+    return ratio
+
+
+def quieter_queue(current, qinfo, need_secs=None):
+    """Least backed-up general queue that is clearly quieter than `current`."""
+    cur = qinfo.get(current)
+    if not cur:
+        return None
+    best = None
+    for name in GENERAL_QUEUES:
+        q = qinfo.get(name)
+        if not q or name == current or "Active" not in q["status"]:
+            continue
+        if q["max"] and q["run"] >= q["max"]:
+            continue
+        if need_secs and q["limit"] and q["limit"] < need_secs:
+            continue
+        if backlog(q) < backlog(cur) / 2 and (best is None or backlog(q) < backlog(qinfo[best])):
+            best = name
+    return best
+
+
+def ids_of(js, n=12):
+    ids = [j["id"].split("[")[0] for j in js]
+    ids = list(dict.fromkeys(ids))
+    return " ".join(ids[:n]) + (" …" if len(ids) > n else "")
+
+
+def pend_tips(short, js, ctx):
+    """One or two lines of advice for a group of pending jobs sharing a reason."""
+    by_id, qinfo, stats = ctx["by_id"], ctx["qinfo"], ctx["stats"]
+    tips = []
+    if "NEVER" in short:
+        tips.append("The job they wait for failed or has been forgotten by LSF, so these will sit "
+                    "here forever. See 'Needs attention' for the bkill line, then resubmit.")
+    elif short == "waiting on dependency":
+        parents = Counter()
+        for j in js:
+            for pid in re.findall(r"\d+(?:\[\d+\])?", j["dependency"]):
+                p = by_id.get(pid)
+                parents[p["stat"] if p else "gone"] += 1
+        bits = [f"{k} {s}" for s, k in parents.most_common()]
+        tips.append("Normal: they start when the job they depend on finishes. Parents: "
+                    + ", ".join(bits) + ".")
+        if parents.get("gone"):
+            tips.append("'gone' parents finished >1h ago; if one ended badly (with done()) the child "
+                        "will flip to 'can NEVER be met'. Check with " + cyan("bjdepinfo <jobid>") + ".")
+    elif short.startswith("queue ") and short.endswith(" full"):
+        qname = short.split()[1]
+        q = qinfo.get(qname, {})
+        tips.append(f"{qname} is capped at {q.get('max') or '?'} running jobs for the whole cluster "
+                    "and is at that cap; yours start as others' finish.")
+        need = None
+        hist = [stats[j["group"]] for j in js if stats[j["group"]]["p90"]]
+        if hist:
+            need = max(h["p90"] for h in hist) * 2
+        alt = quieter_queue(qname, qinfo, need)
+        if alt:
+            lim = dur(qinfo[alt]["limit"]) if qinfo[alt]["limit"] else "no"
+            cond = "" if need else f" — only if they finish within {lim} ({alt}'s run limit)"
+            tips.append(f"Quieter option: {cyan(f'bswitch {alt} ' + ids_of(js))}{cond}.")
+    elif short == "no free slots on eligible hosts":
+        cores = Counter(j["nreq"] for j in js)
+        mem = max((j["memlimit"] or 0) for j in js)
+        req = ", ".join(f"{k}×{n} cores" for n, k in sorted(cores.items()))
+        tips.append(f"Every host that could fit them is busy (requests: {req}, up to {gb(mem)}). "
+                    "The cluster is just full; asking for fewer cores/less memory widens the pool.")
+    elif short == "waiting for big enough host":
+        tips.append("No host currently has enough free cores/memory for the request. Lower -n / -M "
+                    "if the finished-job table shows you over-request; very large jobs may need hugemem.")
+    elif "start time" in short:
+        tips.append(f"Submitted with bsub -b; they won't start before that time. "
+                    f"{cyan('bjobs -l ' + ids_of(js, 3))} shows when; "
+                    f"{cyan('bmod -bn <jobid>')} removes it.")
+    elif "per-user limit" in short:
+        tips.append("You're at a per-user cap; jobs start as your others finish. "
+                    + cyan("busers -w") + " shows the limits.")
+    elif short.startswith("held"):
+        tips.append(f"You paused them. {cyan('bresume ' + ids_of(js))} lets them run.")
+    elif short == "just submitted":
+        tips.append("The scheduler hasn't looked at them yet; give it a minute.")
+    else:
+        tips.append(f"Unrecognised reason; {cyan('bjobs -p ' + ids_of(js, 3))} shows LSF's full text.")
+    return tips
+
+
+GLOSSARY = """
+JOB STATES
+  PEND    waiting to be scheduled (see 'Why pending' for the reason)
+  RUN     running
+  PSUSP   suspended by you before it started (bstop) — bresume <id>
+  USUSP   suspended by you while running (bstop) — bresume <id>
+  SSUSP   suspended by the system (e.g. host overloaded, or preempted); resumes itself
+  DONE    finished with exit code 0
+  EXIT    finished with a non-zero exit code, was killed, or hit a limit
+  UNKWN   LSF lost contact with the host; usually recovers, else bkill and resubmit
+  ZOMBI   killed but the host hasn't confirmed; clears on its own
+
+TERMS
+  slot / core      one CPU core; bsub -n N asks for N
+  memory limit     bsub -M <MB> + -R "select[mem>X] rusage[mem=X]"; exceeding -M kills the job (TERM_MEMLIMIT)
+  run limit        bsub -W [hh:]mm; defaults to the queue's maximum if you don't set one
+  dependency       bsub -w 'done(123)' — waits for 123 to succeed; ended(123) waits for it to finish
+                   in any state. If 123 fails, a done() child can never run ("never satisfied").
+  queue            normal 12h · long 48h · week 7d · basement 30d (run-time maximums on this farm).
+                   Shorter queues are usually less contended; basement has a cluster-wide cap.
+  pend:run         pending ÷ running jobs in a queue across the whole cluster: a rough measure
+                   of how backed up it is.
+  fairshare        LSF favours users who've used less recently, so a big recent burst of
+                   your jobs lowers your priority for a while.
+  history          bjobs forgets finished jobs after about an hour; use bhist / bacct for older ones.
+
+BJSTAT COLUMNS
+  med runtime      median run time of DONE jobs in the group (last ~hour)
+  fin/hr           jobs in the group that finished in the last hour
+  ETA              ~ estimate · ≥ lower bound · ≤ only the run limit is known
+                   overdue: running longer than 90% of finished jobs in the group
+                   no history: nothing in the group has finished recently, so no estimate
+                   stuck: only jobs that can never start remain
+  session          the Claude Code session whose shell ran bsub (from the job's saved
+                   environment); live = still open, ended = closed (claude --resume <id>)
+  cpu eff          CPU time ÷ (wall time × cores): how busy the requested cores actually were
+
+HANDY COMMANDS
+  bjobs -l <id>          everything about one job        bjobs -p        all pend reasons in full
+  bpeek <id>             stdout of a running job         bhist -l <id>   a job's full history
+  bkill <id>             kill (bkill 0 = all yours)      bacct -l <id>   resource use after it ends
+  bmod <opts> <id>       change a pending job's request (e.g. bmod -M 8000 -W 2:00 <id>)
+  bswitch <queue> <id>   move a pending job to another queue
+  bstop / bresume <id>   pause / continue                bjdepinfo <id>  what a job is waiting on
+  bqueues -l <queue>     queue limits and policies       busers -w       your job limits
+"""
+
+
+# ---------- analysis ----------
+
+def group_stats(js, now):
+    done = [j for j in js if j["stat"] == "DONE"]
+    runtimes = [j["run"] for j in done if j["run"] > 0]
+    s = {
+        "n": Counter(j["stat"] for j in js),
+        "med": statistics.median(runtimes) if runtimes else None,
+        "p90": pct(runtimes, 0.9),
+        "n_rt": len(runtimes),
+    }
+    # completions in the last hour (from what bjobs still remembers)
+    s["rate"] = sum(1 for j in js if j["stat"] in ("DONE", "EXIT", "KILLED") and j["finish"]
+                    and now - j["finish"] < 3600)
+    return s
+
+
+def job_remaining(j, st):
+    """Seconds left for a running job -> (secs or None, kind).
+    kind: 'est' (from group history), 'bound' (only the run limit is known),
+    'overdue' (already longer than 90% of finished jobs in its group)."""
+    el = j["run"]
+    lim_left = (j["limit"] - el) if j["limit"] else None
+    if st["med"] is not None and st["n_rt"] >= 3:
+        if el < st["med"]:
+            est = st["med"] - el
+        elif st["p90"] and el < st["p90"]:
+            est = st["p90"] - el
+        else:
+            return None, "overdue"
+        return (min(est, lim_left) if lim_left is not None else est), "est"
+    return lim_left, "bound"
+
+
+def group_eta(js, st, rem_by_id):
+    """Rough time until the whole group drains -> (secs or None, label prefix)."""
+    running = [j for j in js if j["stat"] == "RUN"]
+    pending = [j for j in js if j["stat"] == "PEND" and DEAD_DEP not in j["pend_reason"]]
+    if not running and not pending:
+        return None, "stuck" if any(DEAD_DEP in j["pend_reason"] for j in js) else "done"
+    kinds = {rem_by_id[j["id"]][1] for j in running}
+    have_hist = st["med"] is not None and st["n_rt"] >= 3
+    if pending and not have_hist:
+        return None, "no history"
+    if not pending and kinds == {"bound"}:
+        return max(rem_by_id[j["id"]][0] or 0 for j in running), "≤"
+    run_rem = [rem_by_id[j["id"]][0] for j in running if rem_by_id[j["id"]][1] == "est"]
+    if not run_rem and not pending:
+        return None, "overdue"
+    conc = max(len(running), 1)
+    eta = (sum(run_rem) + len(pending) * (st["med"] or 0)) / conc
+    if run_rem:
+        eta = max(eta, max(run_rem))
+    prefix = "~"
+    if "overdue" in kinds or "bound" in kinds:
+        prefix = "≥"            # some running jobs have no usable estimate
+    if pending and not running:
+        prefix = "≥"            # still need to get through the queue
+    return eta, prefix
+
+
+# ---------- report ----------
+
+def report(args):
+    now = time.time()
+    jobs = load_jobs(args.user, args.name, args.group_by)
+    me = os.environ.get("USER", "")
+    other = bool(args.user and args.user != me)
+    want_origin = not args.no_origin
+    if want_origin and jobs:
+        add_origins(jobs, other_user=other)
+    if args.from_ and jobs:
+        f = args.from_.lower()
+        if f == "here":
+            here_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            cwd = os.getcwd()
+            jobs = [j for j in jobs if (here_sid and j.get("sid") == here_sid)
+                    or (j["cwd"] and (j["cwd"] + "/").startswith(cwd + "/"))]
+        else:
+            jobs = [j for j in jobs if f in (j["cwd"] or "").lower()
+                    or f in (j.get("sid") or "").lower()
+                    or f in ((j.get("session") or {}).get("title") or "").lower()
+                    or f in ((j.get("session") or {}).get("name") or "").lower()]
+    who = args.user or me or "you"
+    filt = " ".join(x for x in (args.name and f"name={args.name}", args.from_ and f"from={args.from_}") if x)
+    print(bold(f"bjstat — {who} — {datetime.now():%a %d %b %H:%M:%S}")
+          + (dim(f"  (filter: {filt})") if filt else ""))
+    if not jobs:
+        print("\n  No jobs found (bjobs only remembers finished jobs for about an hour).")
+        return
+
+    active = [j for j in jobs if j["stat"] not in ("DONE", "EXIT", "KILLED")]
+    qinfo = {} if args.no_queues else load_queues()
+    n = Counter(j["stat"] for j in jobs)
+    dead = [j for j in jobs if j["stat"] == "PEND" and DEAD_DEP in j["pend_reason"]]
+    run_slots = sum(j["slots"] for j in jobs if j["stat"] == "RUN")
+    run_mem = sum(j["memlimit"] or 0 for j in jobs if j["stat"] == "RUN")
+    used_mem = sum(j["mem"] or 0 for j in jobs if j["stat"] == "RUN")
+
+    # --- headline
+    parts = [green(f"{n['RUN']} running"), yellow(f"{n['PEND']} pending")]
+    for s in ("PSUSP", "USUSP", "SSUSP", "UNKWN", "ZOMBI"):
+        if n[s]:
+            parts.append(red(f"{n[s]} {s}"))
+    parts += [f"{n['DONE']} done", (red if n["EXIT"] else str)(f"{n['EXIT']} failed")]
+    if n["KILLED"]:
+        parts.append(dim(f"{n['KILLED']} killed by you"))
+    print("\n  " + " · ".join(parts) + dim("   (done/failed = last ~hour)"))
+    if n["RUN"]:
+        print(f"  Using {run_slots} cores, {gb(used_mem)} RAM in use of {gb(run_mem)} reserved")
+
+    # --- waiting times
+    pend = [j for j in jobs if j["stat"] == "PEND"]
+    started = [j for j in jobs if j["start"] and j["submit"]]
+    print()
+    print(bold("Waiting"))
+    live_active = [j for j in active if DEAD_DEP not in j["pend_reason"]]
+    if live_active:
+        oldest = min(live_active, key=lambda j: j["submit"] or now)
+        print(f"  Oldest active job submitted {dur(now - oldest['submit'])} ago "
+              f"({when(oldest['submit'])}, {oldest['group']})")
+    if pend:
+        waits = [j["waiting"] for j in pend if "waiting" in j]
+        live = [j for j in pend if DEAD_DEP not in j["pend_reason"]]
+        lw = [j["waiting"] for j in live if "waiting" in j]
+        if lw:
+            print(f"  Pending jobs have waited: median {dur(statistics.median(lw))}, "
+                  f"longest {dur(max(lw))}")
+    if started:
+        qwaits = [j["start"] - j["submit"] for j in started]
+        recent = [j["start"] - j["submit"] for j in started if now - j["start"] < 3600]
+        msg = f"  Queue wait before starting: median {dur(statistics.median(qwaits))}, " \
+              f"max {dur(max(qwaits))} (n={len(qwaits)})"
+        if recent:
+            msg += f"; jobs started in the last hour waited median {dur(statistics.median(recent))}"
+        print(msg)
+
+    # --- per-group table
+    groups = defaultdict(list)
+    for j in jobs:
+        groups[j["group"]].append(j)
+    stats = {g: group_stats(js, now) for g, js in groups.items()}
+    rem = {}
+    for g, js in groups.items():
+        for j in js:
+            if j["stat"] == "RUN":
+                rem[j["id"]] = job_remaining(j, stats[g])
+
+    rows = []
+    eta_all = []
+    order = sorted(groups, key=lambda g: (-(stats[g]["n"]["RUN"] + stats[g]["n"]["PEND"]), g))
+    for g in order:
+        js, st = groups[g], stats[g]
+        eta, flag = group_eta(js, st, rem)
+        if eta is not None:
+            eta_all.append(eta)
+        q = ",".join(sorted({j["queue"] for j in js}))
+        rows.append([
+            g[:40],
+            green(st["n"]["RUN"]) if st["n"]["RUN"] else dim(0),
+            yellow(st["n"]["PEND"]) if st["n"]["PEND"] else dim(0),
+            st["n"]["DONE"] or dim(0),
+            red(st["n"]["EXIT"]) if st["n"]["EXIT"] else dim(0),
+            dur(st["med"]) if st["med"] is not None else dim("-"),
+            st["rate"] or dim(0),
+            (flag + dur(eta)) if eta is not None else
+            (red("stuck") if flag == "stuck" else yellow(flag) if flag == "overdue" else dim(flag)),
+            dim(q),
+        ])
+    print()
+    print(bold("By job group") + dim(f"  (grouped by {args.group_by}; -g name for full names)"))
+    print(table(rows, ["group", "run", "pend", "done", "fail", "med runtime", "fin/hr",
+                       "ETA", "queue"], ["<", ">", ">", ">", ">", ">", ">", ">", "<"]))
+    if eta_all:
+        print(dim("  ETA ≈ (time left on running + pending × median runtime) / jobs running now.\n"
+                  "  ~ estimate · ≥ lower bound (overdue jobs, or queue wait not included) · "
+                  "≤ only the run limit is known"))
+    labels = {ANSI.sub("", str(r[7])) for r in rows}
+    if not args.no_tips and labels & {"no history", "stuck", "overdue"}:
+        notes = []
+        if "no history" in labels:
+            notes.append("'no history': nothing in that group has finished in the last hour, so no "
+                         "runtime to estimate from — it'll fill in once some finish")
+        if "overdue" in labels:
+            notes.append("'overdue': its running jobs have outlasted 90% of finished ones; check them "
+                         "with bpeek <id> if that's unexpected")
+        if "stuck" in labels:
+            notes.append("'stuck': only jobs that can never start remain (see Needs attention)")
+        for n_ in notes:
+            print(dim("  ") + cyan("tip") + dim(" " + n_))
+
+    # --- where jobs came from
+    if want_origin:
+        src = defaultdict(list)
+        for j in jobs:
+            if j["stat"] in ("DONE", "KILLED"):
+                continue
+            src[(j.get("sid") or "", j["cwd"] or "")].append(j)
+        if src:
+            orows = []
+            for (sid, cwd), js_ in sorted(src.items(),
+                                          key=lambda kv: (-sum(j["stat"] in ("RUN", "PEND") for j in kv[1]),
+                                                          kv[0][1])):
+                cnt = Counter(j["stat"] for j in js_)
+                grp = ", ".join(g for g, _ in Counter(j["group"] for j in js_).most_common(3))
+                orows.append([short_dir(cwd)[:40], origin_label(js_[0], 45), origin_state(js_[0]),
+                              green(cnt["RUN"]) if cnt["RUN"] else dim(0),
+                              yellow(cnt["PEND"]) if cnt["PEND"] else dim(0),
+                              red(cnt["EXIT"]) if cnt["EXIT"] else dim(0), dim(grp[:40])])
+            print()
+            print(bold("Where they came from") + dim("  (submit dir · Claude Code session that ran bsub)"))
+            print(table(orows, ["submitted from", "session", "state", "run", "pend", "fail", "groups"],
+                        ["<", "<", "<", ">", ">", ">", "<"]))
+            ended = {j["sid"] for j in jobs if j.get("sid") and j["stat"] in ("RUN", "PEND", "EXIT")
+                     and not (j.get("session") or {}).get("live")}
+            if ended and not args.no_tips and not other:
+                sid = sorted(ended)[0]
+                print(f"  {cyan('tip')} jobs from an ended session keep running. To pick that "
+                      f"conversation back up: cd to its dir and {cyan('claude --resume ' + sid)}"
+                      + (dim(f" (+{len(ended) - 1} more ended)") if len(ended) > 1 else ""))
+            print(dim("  filter with --from <dir / session title / id>, or --from here for this "
+                      "dir/session"))
+
+    # --- pending reasons
+    if pend:
+        by_reason = defaultdict(list)
+        for j in pend:
+            by_reason[short_reason(j["pend_reason"])].append(j)
+        ctx = {"by_id": {j["id"]: j for j in jobs}, "qinfo": qinfo, "stats": stats}
+        print()
+        print(bold("Why pending"))
+        for r, js_ in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+            col = red if "NEVER" in r else str
+            print(f"  {len(js_):>5}  {col(r)}")
+            if not args.no_tips:
+                for t in pend_tips(r, js_, ctx):
+                    print(f"         {cyan('↳')} {dim(t) if not USE_COLOR else t}")
+
+    # --- problems
+    warn = []
+    if dead:
+        ids = " ".join(j["id"].split("[")[0] for j in dead)
+        warn.append(red(f"{len(dead)} job(s) can never start (their dependency failed or no longer exists):"))
+        for j in dead[:8]:
+            warn.append(f"      {j['id']:>10}  {j['name'][:50]}  {dim(j['dependency'])}")
+        if len(dead) > 8:
+            warn.append(dim(f"      … and {len(dead) - 8} more"))
+        warn.append(f"    clear them with:  {cyan('bkill ' + ids)}")
+
+    failed = [j for j in jobs if j["stat"] == "EXIT"]
+    if failed:
+        warn.append(red(f"{len(failed)} job(s) failed:"))
+        for j in failed[:10]:
+            log = j["err"] or j["out"]
+            if log and j["cwd"] and not log.startswith("/"):
+                log = os.path.join(j["cwd"], log)
+            why = f"exit {j['exit_code']}" if j["exit_code"] else "exit ?"
+            if j["exit_reason"]:
+                why += f", {j['exit_reason']}"
+            if j["max_mem"] and j["memlimit"] and j["max_mem"] >= 0.95 * j["memlimit"]:
+                why += ", " + red("likely out of memory")
+            if j["limit"] and j["run"] >= 0.99 * j["limit"]:
+                why += ", " + red("hit run limit")
+            warn.append(f"      {j['id']:>10}  {j['name'][:45]}  {why}  {dim(log)}")
+            if want_origin and j.get("sid"):
+                warn.append(dim(f"                  from {origin_label(j, 50)} in {short_dir(j['cwd'])}"))
+        if len(failed) > 10:
+            warn.append(dim(f"      … and {len(failed) - 10} more"))
+
+    hot = [j for j in jobs if j["stat"] == "RUN" and j["max_mem"] and j["memlimit"]
+           and j["max_mem"] >= 0.85 * j["memlimit"]]
+    if hot:
+        warn.append(yellow(f"{len(hot)} running job(s) at ≥85% of their memory limit (OOM risk):"))
+        for j in hot[:6]:
+            warn.append(f"      {j['id']:>10}  {j['name'][:45]}  {gb(j['max_mem'])}/{gb(j['memlimit'])}")
+
+    near_limit = [j for j in jobs if j["stat"] == "RUN" and j["limit"]
+                  and j["run"] >= 0.8 * j["limit"]]
+    if near_limit:
+        warn.append(yellow(f"{len(near_limit)} running job(s) have used ≥80% of their run limit:"))
+        for j in near_limit[:6]:
+            warn.append(f"      {j['id']:>10}  {j['name'][:45]}  {dur(j['run'])}/{dur(j['limit'])}")
+
+    susp = [j for j in jobs if j["stat"] in ("PSUSP", "USUSP", "SSUSP")]
+    if susp:
+        warn.append(yellow(f"{len(susp)} suspended job(s): " + " ".join(j["id"] for j in susp[:10])
+                           + dim("  (bresume <id> if you held them)")))
+
+    if warn:
+        print()
+        print(bold("Needs attention"))
+        print("\n".join("  " + w for w in warn))
+
+    # --- efficiency of finished jobs (helps right-size the next submission)
+    eff_rows = []
+    for g in order:
+        done = [j for j in groups[g] if j["stat"] == "DONE"]
+        if len(done) < 3:
+            continue
+        mm = [j["max_mem"] for j in done if j["max_mem"]]
+        ml = [j["memlimit"] for j in done if j["memlimit"]]
+        cpu_eff = [j["cpu"] / (j["run"] * j["slots"]) for j in done
+                   if j["cpu"] and j["run"] > 30 and j["slots"]]
+        if not mm or not ml:
+            continue
+        peak, req = max(mm), statistics.median(ml)
+        ce = statistics.median(cpu_eff) if cpu_eff else None
+        tips = []
+        if req >= 4 and peak < 0.4 * req:
+            tips.append(f"-M {math.ceil(peak * 1.5)}G would do")
+        if ce is not None and ce < 0.4 and done[0]["slots"] > 1:
+            tips.append(f"only ~{max(1, round(ce * done[0]['slots']))} of {done[0]['slots']} cores busy")
+        eff_rows.append([g[:40], len(done), gb(pct(mm, 0.5)), gb(peak), gb(req),
+                         f"{ce * 100:.0f}%" if ce is not None else "-",
+                         yellow("; ".join(tips)) if tips else dim("ok")])
+    if eff_rows:
+        print()
+        print(bold("Resource use of finished jobs") + dim("  (to right-size the next batch)"))
+        print(table(eff_rows, ["group", "n", "med mem", "peak mem", "requested", "cpu eff", "suggestion"],
+                    ["<", ">", ">", ">", ">", ">", "<"]))
+
+    # --- cluster context for the queues you use
+    qs = sorted({j["queue"] for j in active})
+    if qs and not args.no_queues:
+        mine = Counter((j["queue"], j["stat"]) for j in active)
+        qrows, qtips = [], []
+        for name in qs:
+            q = qinfo.get(name)
+            if not q:
+                continue
+            p, r = q["pend"], q["run"]
+            cap = f"{r}/{q['max']}" if q["max"] else f"{r}"
+            qrows.append([name, f"{mine[(name, 'RUN')]}/{mine[(name, 'PEND')]}", cap, f"{p}",
+                          (yellow if p > r else str)(f"{p / r:.1f}×" if r else "-"),
+                          dur(q["limit"]) if q["limit"] else "-", dim(q["status"])])
+            my_pend = [j for j in active if j["queue"] == name and j["stat"] == "PEND"
+                       and DEAD_DEP not in j["pend_reason"]
+                       and "dependency" not in short_reason(j["pend_reason"])]
+            if my_pend and r and p / r >= 5:
+                alt = quieter_queue(name, qinfo)
+                t = (f"{name} is very backed up ({p / r:.0f} jobs waiting per running job); "
+                     f"your {len(my_pend)} pending there may wait a long time.")
+                if alt:
+                    t += (f" If they'd finish within {dur(qinfo[alt]['limit'])}, "
+                          f"{cyan(f'bswitch {alt} ' + ids_of(my_pend))} is less contended "
+                          f"({backlog(qinfo[alt]):.1f}×).")
+                qtips.append(t)
+        if qrows:
+            print()
+            print(bold("Queues you're using") + dim("  (whole cluster; slots)"))
+            print(table(qrows, ["queue", "yours run/pend", "running", "pending", "pend:run",
+                                "max run", "status"], ["<", ">", ">", ">", ">", ">", "<"]))
+            if not args.no_tips:
+                for t in qtips:
+                    print(f"  {cyan('tip')} {t}")
+
+    # --- per-job listing
+    if args.long:
+        print()
+        print(bold("Active jobs"))
+        lrows = []
+        for j in sorted(active, key=lambda j: (j["stat"] != "RUN", j["group"], j["submit"] or 0)):
+            if j["stat"] == "RUN":
+                r_, kind = rem.get(j["id"], (None, "?"))
+                eta = {"est": "~", "bound": "≤"}.get(kind, "") + dur(r_) if r_ is not None \
+                    else (yellow("overdue") if kind == "overdue" else "?")
+                mem = f"{gb(j['mem'])}/{gb(j['memlimit'])}"
+                state = green("RUN")
+                elapsed = dur(j["run"])
+                note = ""
+            else:
+                eta, mem = dim("-"), dim(gb(j["memlimit"]))
+                state = yellow(j["stat"])
+                elapsed = dim("-")
+                note = short_reason(j["pend_reason"])
+                if "NEVER" in note:
+                    note = red(note)
+            lrows.append([j["id"], j["name"].rsplit("/", 1)[-1][:45], state, j["queue"],
+                          dur(now - j["submit"]) if j["submit"] else "-",
+                          elapsed, eta.strip() or "-", mem,
+                          dim(short_dir(j["cwd"])[:28] + (f" · {j['sid'][:8]}" if j.get("sid") else "")),
+                          dim(note)])
+        print(table(lrows, ["jobid", "name", "stat", "queue", "age", "running", "left", "mem",
+                            "from (dir · session)", "note"],
+                    ["<", "<", "<", "<", ">", ">", ">", ">", "<", "<"]))
+
+
+# ---------- single job: bjstat JOBID ----------
+
+JOB_HELP = """bjstat JOBID [options] — everything about one job.
+
+  bjstat 992350            card: state, times, memory/CPU use vs request, command, logs
+                           (sizes, last write, tail), files the job has written since it
+                           started and where, and exit diagnosis for failed jobs
+  bjstat 992350[7]         one element of an array job; bjstat 992350 lists the elements
+  bjstat 992350 -F         follow the job's stdout+stderr live (stderr in red) until it ends
+  bjstat 992350 -w 10      redraw the card every 10 s
+  -n N                     lines of each log to show (default 12)
+  --no-files               skip the scan for files written by the job
+  --deep                   job too old for bjobs: search all LSF event logs (bhist -n 0, ~2 min)
+
+Logs are written live on this cluster (LSB_STDOUT_DIRECT=Y), so the tail is current.
+"Files written" is found from the filesystem (no access to compute nodes): files changed
+since the job started under its working dir and the dirs named on its command line. Other
+jobs running from the same dir can also have written them; the card says when that applies.
+"""
+
+JFIELDS = ("jobid jobindex stat queue job_name nreq_slot exec_host exec_cwd sub_cwd command pids mem max_mem "
+           "avg_mem swap cpu_used run_time runtimelimit nthreads idle_factor slots memlimit "
+           "submit_time start_time finish_time pend_reason pend_time exit_code exit_reason "
+           "dependency output_file error_file effective_resreq")
+
+EXIT_MEANING = {
+    1: "general error (see stderr)", 2: "misuse of a shell builtin / bad arguments",
+    126: "command not executable", 127: "command not found (PATH / module not loaded?)",
+    130: "interrupted (SIGINT)", 134: "aborted (SIGABRT: assert / abort())",
+    135: "bus error (SIGBUS)", 137: "killed (SIGKILL: memory limit, bkill or the node)",
+    139: "segmentation fault (SIGSEGV)", 140: "SIGUSR2 (LSF run-limit warning)",
+    141: "broken pipe (SIGPIPE)", 143: "terminated (SIGTERM: bkill, run limit or preemption)",
+    152: "CPU time limit (SIGXCPU)", 153: "file size limit (SIGXFSZ)",
+}
+TERM_MEANING = {
+    "TERM_MEMLIMIT": "hit its memory limit (-M); resubmit with ~2x the max memory seen",
+    "TERM_RUNLIMIT": "hit the queue's / -W run limit; use a longer queue or checkpoint",
+    "TERM_OWNER": "you killed it (bkill)", "TERM_ADMIN": "killed by an administrator",
+    "TERM_REQUEUE_OWNER": "requeued by you", "TERM_FORCE_OWNER": "force-killed by you",
+    "TERM_SWAP": "hit its swap limit", "TERM_CPULIMIT": "hit its CPU-time limit",
+    "TERM_PROCESSLIMIT": "hit the process limit", "TERM_THREADLIMIT": "hit the thread limit",
+    "TERM_UNKNOWN": "LSF couldn't tell (often the node failed)", "TERM_EXTERNAL_SIGNAL":
+    "killed by a signal from outside LSF", "TERM_PREEMPT": "preempted by a higher-priority job",
+}
+ERR_PAT = re.compile(r"(error|exception|traceback|killed|fatal|abort|segmentation|"
+                     r"no such file|permission denied|out of memory|oom|cannot|failed)", re.I)
+
+
+def hbytes(b):
+    for u in ("B", "K", "M", "G", "T"):
+        if b < 1024 or u == "T":
+            return f"{b:.0f}{u}" if u in ("B", "K") else f"{b:.1f}{u}"
+        b /= 1024
+
+
+def bar(frac, width=24):
+    if frac is None:
+        return ""
+    n = int(round(min(max(frac, 0), 1) * width))
+    col = red if frac >= 0.9 else yellow if frac >= 0.75 else green
+    return col("█" * n) + dim("░" * (width - n))
+
+
+def ago_s(ts):
+    return dur(time.time() - ts) + " ago" if ts else "-"
+
+
+def job_records(jid):
+    return [r for r in run_json(["bjobs", "-a", "-json", "-o", JFIELDS, jid]).get("RECORDS", [])
+            if not r.get("ERROR")]
+
+
+def job_long(jid):
+    """Extra bits only `bjobs -l` has: efficiencies, full pending reasons, start estimate."""
+    try:
+        txt = subprocess.run(["bjobs", "-l", jid], capture_output=True, text=True, timeout=60).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    flat = re.sub(r"\n\s{21,}", "", txt)
+    out = {}
+    for key, pat in (("cpu_eff", r"CPU AVERAGE EFFICIENCY:\s*([\d.]+)%"),
+                     ("cpu_peak", r"CPU PEAK:\s*([\d.]+)"),
+                     ("mem_eff", r"MEM Efficiency:\s*([\d.]+)%")):
+        m = re.search(pat, flat)
+        if m:
+            out[key] = float(m.group(1))
+    m = re.search(r"PENDING REASONS:\n(.*?)(?:\n\s*\n|\Z)", flat, re.S)
+    if m:
+        out["pending"] = [l.strip() for l in m.group(1).splitlines() if l.strip()]
+    m = re.search(r"\w{3} (\w{3}\s+\d+ \d+:\d+:\d+)(?: \d{4})?: Started", flat)
+    if m:
+        try:
+            out["started"] = datetime.strptime(f"{m.group(1)} {datetime.now().year}",
+                                               "%b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            pass
+    m = re.search(r"Job will start no sooner than indicated time stamp", flat)
+    m2 = re.search(r"(\w{3} \w{3}\s+\d+ [\d:]+): Reserved", flat)
+    if m:
+        out["start_hint"] = "LSF says it will start no sooner than its reservation" + \
+                            (f" ({m2.group(1)})" if m2 else "")
+    return out
+
+
+def bhist_record(jid, deep):
+    """Minimal record for a job bjobs has forgotten, parsed from bhist -l."""
+    cmd = ["bhist", "-l"] + (["-n", "0"] if deep else []) + [jid]
+    try:
+        txt = subprocess.run(cmd, capture_output=True, text=True, timeout=600).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if "Job <" not in txt:
+        return None
+    flat = re.sub(r"\n\s{21,}", "", txt)
+    g = lambda pat: (re.search(pat, flat, re.S) or [None, None])[1]
+    rec = {"JOBID": jid.split("[")[0], "JOB_NAME": g(r"Job Name <([^>]*)>") or "",
+           "COMMAND": g(r"Command <(.*?)>(?:,|\n)") or "", "QUEUE": g(r"to Queue <([^>]*)>") or "",
+           "SUB_CWD": (g(r"CWD <([^>]*)>") or "").replace("$HOME", os.path.expanduser("~")),
+           "OUTPUT_FILE": g(r"Output File <([^>]*)>") or "", "ERROR_FILE": g(r"Error File <([^>]*)>") or "",
+           "EXEC_HOST": " ".join(sorted(set(re.findall(r"<(node-[\w-]+)>", flat))))}
+    rec["OUTPUT_FILE"] = rec["OUTPUT_FILE"].replace("%J", rec["JOBID"])
+    rec["ERROR_FILE"] = rec["ERROR_FILE"].replace("%J", rec["JOBID"])
+    rec["EXEC_CWD"] = (g(r"Execution CWD <([^>]*)>") or rec["SUB_CWD"]).replace("$HOME", os.path.expanduser("~"))
+    if re.search(r"Done successfully", flat):
+        rec["STAT"] = "DONE"
+    elif re.search(r"Exited with exit code (\d+)", flat):
+        rec["STAT"], rec["EXIT_CODE"] = "EXIT", g(r"Exited with exit code (\d+)")
+    elif re.search(r"Exited", flat):
+        rec["STAT"] = "EXIT"
+    else:
+        rec["STAT"] = "?"
+    rec["EXIT_REASON"] = " ".join(re.findall(r"(TERM_\w+)", flat))
+    rec["MAX_MEM"] = g(r"MAX MEM: ([\d.]+ \w+)")
+    rec["AVG_MEM"] = g(r"AVG MEM: ([\d.]+ \w+)")
+    rec["MEMLIMIT"] = (g(r"MEMLIMIT\s*\n\s*([\d.]+ \w)") or "")
+    rec["CPU_USED"] = g(r"CPU time used is ([\d.]+) seconds")
+    yr = datetime.now().year
+    def ts(pat):
+        s = g(pat)
+        return f"{s} {yr}" if s else None
+    rec["SUBMIT_TIME"] = ts(r"\w{3} (\w{3}\s+\d+ [\d:]+): Submitted")
+    rec["START_TIME"] = ts(r"\w{3} (\w{3}\s+\d+ [\d:]+): (?:Starting|Dispatched)")
+    rec["FINISH_TIME"] = ts(r"\w{3} (\w{3}\s+\d+ [\d:]+): (?:Done successfully|Exited)")
+    rec["_long"] = {k: float(v) for k, v in (("cpu_eff", g(r"CPU AVERAGE EFFICIENCY: ([\d.]+)%")),
+                                             ("mem_eff", g(r"MEM Efficiency: ([\d.]+)%"))) if v}
+    rec["_source"] = "bhist"
+    return rec
+
+
+def tail_lines(path, n, maxbytes=200_000):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - maxbytes))
+            data = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    lines = data.splitlines()
+    # LSF appends a job report ("Sender: LSF System ...") to the output file at the end: drop it
+    for i, l in enumerate(lines):
+        if l.startswith("Sender: LSF System"):
+            while i > 0 and (not lines[i - 1].strip() or set(lines[i - 1].strip()) <= {"-"}):
+                i -= 1
+            lines = lines[:i] + ["(LSF job report trimmed)"]
+            break
+    # progress bars write \r-separated updates: keep the last state of each line
+    lines = [l.rsplit("\r", 1)[-1] for l in lines]
+    return lines[-n:]
+
+
+def log_block(label, path, n, err=False):
+    if not path:
+        print(f"  {label}: {dim('(not set)')}")
+        return
+    try:
+        st = os.stat(path)
+    except OSError:
+        print(f"  {label}: {short_dir(path)}  {dim('(not there yet)')}")
+        return
+    print(f"  {bold(label)}: {path}  {dim(hbytes(st.st_size) + ', last write ' + ago_s(st.st_mtime))}")
+    lines = tail_lines(path, n) or []
+    if not lines:
+        print(dim("      (empty)"))
+    for l in lines:
+        l = l[:220]
+        if l == "(LSF job report trimmed)":
+            print(dim("      " + l)); continue
+        print("    " + (red(l) if err and ERR_PAT.search(l) else dim("│ ") + l))
+
+
+CMD_SKIP = ("/software/", "/usr/", "/bin/", "/etc/", "/opt/", "/dev/", "/proc/")
+
+
+def candidate_dirs(cwd, command):
+    """The job's cwd plus directories named on its command line (not tool/system paths)."""
+    dirs = []
+    if cwd and os.path.isdir(cwd):
+        dirs.append(os.path.realpath(cwd))
+    for tok in re.findall(r"[\w./~${}-]*/[\w./${}-]+", command or ""):
+        tok = os.path.expanduser(tok.strip("'\""))
+        if not tok.startswith("/"):
+            tok = os.path.join(cwd or "/", tok)
+        if any(tok.startswith(p) for p in CMD_SKIP) or "/.local/bin" in tok or "/target/release" in tok:
+            continue
+        d = tok if os.path.isdir(tok) else os.path.dirname(tok)
+        if os.path.isdir(d):
+            d = os.path.realpath(d)
+            if os.access(d, os.W_OK) and d not in dirs:
+                dirs.append(d)
+    # drop dirs inside another candidate
+    dirs.sort(key=len)
+    out = []
+    for d in dirs:
+        if not any(d == o or d.startswith(o + "/") for o in out):
+            out.append(d)
+    return out[:6]
+
+
+def files_written(dirs, since, exclude=()):
+    """[(path, bytes, mtime)] for files changed after `since` under dirs (fd, 25 s budget)."""
+    stamp = datetime.fromtimestamp(since - 5).strftime("%Y-%m-%d %H:%M:%S")
+    found = []
+    home = os.path.realpath(os.path.expanduser("~"))
+    for d in dirs:
+        broad = d == home or re.search(r"/users/[^/]+$", d) or d.count("/") <= 4
+        depth = ["--max-depth", "1"] if broad else ["--max-depth", "8"]
+        try:
+            r = subprocess.run(["fd", "-t", "f", "-H", "-I", "--changed-after", stamp, "-E", ".git",
+                                *depth, ".", d, "-X", "stat", "-c", "%s\t%Y\t%n"],
+                               capture_output=True, text=True, timeout=12)
+        except (subprocess.TimeoutExpired, OSError):
+            found.append((d + "/…", -1, 0))
+            continue
+        for line in r.stdout.splitlines():
+            s, t, p = line.split("\t", 2)
+            if p not in exclude:
+                found.append((p, int(s), int(t)))
+    return found
+
+
+def files_section(rec, start, finish):
+    cwd = rec.get("EXEC_CWD") or rec.get("SUB_CWD")
+    dirs = candidate_dirs(cwd, rec.get("COMMAND") + " " + " ".join(
+        os.path.dirname(rec.get(k) or "") for k in ("OUTPUT_FILE", "ERROR_FILE")))
+    if not dirs or not start:
+        return
+    logs = {rec.get("OUTPUT_FILE"), rec.get("ERROR_FILE")}
+    t0 = time.time()
+    fs = files_written(dirs, start, exclude=logs)
+    timed_out = [p for p, b, _ in fs if b < 0]
+    fs = [(p, b, t) for p, b, t in fs if b >= 0 and (finish is None or t <= finish + 60)]
+    total = sum(b for _, b, _ in fs)
+    print("\n" + bold("Files written since it started") +
+          dim(f"  ({len(fs)} files, {hbytes(total)}; scanned {', '.join(short_dir(d) for d in dirs)} "
+              f"in {time.time() - t0:.0f}s)"))
+    if timed_out:
+        print(yellow(f"  scan cut short in {', '.join(short_dir(p[:-2]) for p in timed_out)} (too big)"))
+    if not fs:
+        print(dim("  nothing changed there yet (it may write elsewhere, or only at the end)"))
+        return
+    bydir = defaultdict(lambda: [0, 0, 0])
+    for p, b, t in fs:
+        e = bydir[os.path.dirname(p)]
+        e[0] += b; e[1] += 1; e[2] = max(e[2], t)
+    for d, (b, n, t) in sorted(bydir.items(), key=lambda kv: -kv[1][0])[:6]:
+        print(f"  {hbytes(b):>8} {n:>6} files  {short_dir(d):60} {dim('last ' + ago_s(t))}")
+    if len(bydir) > 6:
+        print(dim(f"  … {len(bydir) - 6} more dirs"))
+    stem = re.sub(r"[\[.].*$", "", rec.get("JOB_NAME") or "")
+    named = [f for f in fs if len(stem) >= 4 and stem in os.path.basename(f[0])]
+    if named:
+        print(f"  {len(named)} file(s) named after the job ({stem}*): "
+              f"{hbytes(sum(b for _, b, _ in named))} — the surest sign they're this job's")
+    newest = sorted(fs, key=lambda x: -x[2])[:3]
+    print(dim("  newest: " + ", ".join(f"{os.path.basename(p)} ({hbytes(b)}, {ago_s(t)})" for p, b, t in newest)))
+    if len(fs) > 5000:
+        print(yellow(f"  {len(fs)} new files — the team file quota is nearly full; tar or clean these up"))
+
+
+def job_card(jid, args):
+    recs = job_records(jid)
+    if len(recs) > 1 and "[" not in jid:
+        return array_card(jid, recs)
+    rec = recs[0] if recs else bhist_record(jid, args.deep)
+    if not rec:
+        print(f"bjstat: job {jid} not found. bjobs forgets finished jobs after ~1 h and the current "
+              f"event log rolls over quickly; try `bjstat {jid} --deep` (searches all logs, ~2 min).")
+        return None
+    lng = rec.pop("_long", None) or ({} if rec.get("_source") else job_long(jid))
+    st = rec.get("STAT", "?")
+    if st == "EXIT" and "TERM_OWNER" in (rec.get("EXIT_REASON") or ""):
+        st = "KILLED"
+    sub, start = parse_time(rec.get("SUBMIT_TIME")), parse_time(rec.get("START_TIME"))
+    finish = parse_time(rec.get("FINISH_TIME")) if st in ("DONE", "EXIT", "KILLED") else None
+    run = parse_secs(rec.get("RUN_TIME")) or ((finish or time.time()) - start if start else 0)
+    if lng.get("started"):
+        start = lng["started"]                      # exact to the second (bjobs -o has minutes)
+        if st == "RUN":
+            run = max(run, time.time() - start)     # live, not LSF's ~15 s-old sample
+    limit = (parse_secs(rec.get("RUNTIMELIMIT")) or 0) * 60 or None
+    slots = int(parse_secs(rec.get("SLOTS")) or parse_secs(rec.get("NREQ_SLOT")) or 1)
+    mem, mx, avg = (parse_mem_gb(rec.get(k)) for k in ("MEM", "MAX_MEM", "AVG_MEM"))
+    mlim = parse_mem_gb(rec.get("MEMLIMIT"))
+    cpu = parse_secs(rec.get("CPU_USED"))
+    stcol = {"RUN": green, "PEND": yellow, "DONE": green, "EXIT": red, "KILLED": dim}.get(st, cyan)
+    hosts = (rec.get("EXEC_HOST") or "").split(":")
+    host = f"{hosts[0]}" + (f" ×{len(hosts)}" if len(hosts) > 1 else "") if hosts[0] else ""
+    jidx = rec.get("JOBINDEX", "0")
+    full_id = rec["JOBID"] + (f"[{jidx}]" if jidx not in ("", "0", None) else "")
+
+    print(f"{bold(full_id)}  {bold(cyan(rec.get('JOB_NAME', '')))}  {stcol(st)}  "
+          f"queue {bold(rec.get('QUEUE', '') or '?')}  {bold(str(slots))} core{'s' if slots != 1 else ''}"
+          + (f", {rec['NTHREADS']} threads" if rec.get('NTHREADS') not in (None, '', '-') else '') + f"  {host}" + (dim("  (from bhist)") if rec.get("_source") else ""))
+    j = {"id": full_id, "submit": sub}
+    try:
+        add_origins([j])
+        print(dim(f"  from {short_dir(rec.get('SUB_CWD', ''))} · {origin_label(j, 50)} ") + origin_state(j))
+    except Exception:
+        print(dim(f"  from {short_dir(rec.get('SUB_CWD', ''))}"))
+
+    # times
+    print("\n" + bold("Time"))
+    if sub:
+        waited = (start or time.time()) - sub
+        print(f"  submitted {when(sub)}" + (f", waited {dur(waited)} in the queue" if start or st == "PEND" else ""))
+    if start:
+        frac = run / limit if limit else None
+        live = getattr(args, "compact", False) and not finish
+        d = dur_s if live else dur
+        stamp = datetime.fromtimestamp(start).strftime("%H:%M:%S") if live and lng.get("started") else when(start)
+        line = f"  started   {stamp}, " + (f"ran {dur(run)}" if finish else f"running {d(run)}")
+        if limit:
+            line += f" of {dur(limit)} limit  {bar(frac)}"
+            if not finish and frac and frac > 0.8:
+                line += yellow("  close to the run limit")
+        print(line)
+    if finish:
+        print(f"  finished  {when(finish)} ({ago_s(finish)})")
+
+    # pending
+    if st in ("PEND", "PSUSP"):
+        print("\n" + bold("Why pending"))
+        for r in (lng.get("pending") or [rec.get("PEND_REASON") or "?"])[:6]:
+            print(f"  {short_reason(r)}  {dim(r[:90]) if short_reason(r) != r[:70] else ''}")
+        if rec.get("DEPENDENCY"):
+            print(f"  depends on: {rec['DEPENDENCY']}")
+        if lng.get("start_hint"):
+            print(f"  {lng['start_hint']}")
+        rr = (rec.get("EFFECTIVE_RESREQ") or "").strip()
+        print(dim(f"  requested: {slots} slot(s), {gb(mlim)} memory" + (f"; {rr[:90]}" if rr not in ("", "-") else "")))
+        try:
+            qi = load_queues()
+            q = qi.get(rec.get("QUEUE"))
+            if q:
+                cap = f" of max {q['max']}" if q["max"] else ""
+                print(dim(f"  queue {rec.get('QUEUE')}: {q['run']} running{cap}, {q['pend']} pending (all users)"))
+                alt = quieter_queue(rec.get("QUEUE"), qi, limit) \
+                    if rec.get("QUEUE") in GENERAL_QUEUES and (mlim or 0) < 200 else None
+                if alt:
+                    print(dim(f"  quieter: bswitch {alt} {full_id}"))
+        except Exception:
+            pass
+
+    # resources
+    if start:
+        print("\n" + bold("Resources"))
+        if mlim or mx:
+            frac = (mx / mlim) if (mx and mlim) else None
+            now = f"now {gb(mem)}, " if mem is not None and not finish else ""
+            line = f"  memory    {now}max {gb(mx)}, avg {gb(avg)} of {gb(mlim)}  {bar(frac)}"
+            if getattr(args, "compact", False) and not finish:
+                line += dim("  (LSF sample)")
+            if lng.get("mem_eff") is not None:
+                line += dim(f"  {lng['mem_eff']:.0f}% efficient")
+            print(line)
+            if frac is not None and frac > 0.85 and not finish:
+                print(yellow("            close to the memory limit: TERM_MEMLIMIT likely"))
+            elif mx and mlim and mx < mlim / 4 and run > 600:
+                print(dim(f"            next time -M {max(1, math.ceil(mx * 1.5))}G would do (uses < 1/4 of the request)"))
+        if cpu is not None and run:
+            cores = cpu / run
+            eff = lng.get("cpu_eff", cores / slots * 100)
+            line = f"  cpu       {cores:.1f} of {slots} core(s) on average"
+            line += dim(f"  ({eff:.0f}% efficient" + (f", peak {lng['cpu_peak']:.1f}" if "cpu_peak" in lng else "") + ")")
+            if rec.get("NTHREADS"):
+                line += dim(f", {rec['NTHREADS']} threads")
+            print(line)
+            if cores > slots * 1.15 and run > 120:
+                print(yellow(f"            using {cores:.1f} cores but asked for {slots}: it gets throttled and "
+                             f"crowds the node; request -n {math.ceil(cores)} (or limit its threads)"))
+            elif slots > 1 and eff < 40 and run > 600:
+                print(dim(f"            mostly single-threaded? -n {max(1, math.ceil(cores))} would free slots"))
+        if (parse_mem_gb(rec.get("SWAP")) or 0) > 0.1:
+            print(yellow(f"  swap      {rec['SWAP']} — the job is swapping and will be slow"))
+
+    # command
+    print("\n" + bold("Command") + dim(f"  (cwd {short_dir(rec.get('EXEC_CWD') or rec.get('SUB_CWD', ''))})"))
+    cmd = rec.get("COMMAND", "")
+    lim = 240 if getattr(args, "compact", False) else 480
+    for i in range(0, min(len(cmd), lim), 120):
+        print("  " + cmd[i:i + 120])
+    if len(cmd) > lim:
+        print(dim(f"  … ({len(cmd)} chars)"))
+
+    # exit diagnosis
+    if st in ("EXIT", "KILLED"):
+        print("\n" + bold(red("Exit")))
+        code = rec.get("EXIT_CODE")
+        if code not in (None, ""):
+            print(f"  exit code {code}: {EXIT_MEANING.get(int(code), 'program-specific')}")
+        if not start:
+            print("  it never started (killed or failed while pending), so there are no logs")
+        for t in sorted(set(re.findall(r"TERM_[A-Z_]+", rec.get("EXIT_REASON") or ""))):
+            if t:
+                print(f"  {t}: {TERM_MEANING.get(t, '')}")
+                if t == "TERM_MEMLIMIT" and mx:
+                    print(dim(f"  resubmit: bq -m {math.ceil(mx * 2)}G ... (max seen {gb(mx)})"))
+        errs = [l for l in (tail_lines(rec.get("ERROR_FILE"), 400) or []) if ERR_PAT.search(l)]
+        if errs:
+            print("  last error-looking lines in stderr:")
+            for l in errs[-5:]:
+                print("    " + red(l[:200]))
+
+    if getattr(args, "compact", False):
+        return rec
+
+    # logs
+    if not start:
+        print("\n" + dim(f"  bjstat {full_id} -F  follow logs once it starts   ·   bdone {full_id}  wait for it"
+                         + (f"   ·   bkill {full_id}" if st in ("RUN", "PEND") else "")))
+        return rec
+    print("\n" + bold("Logs"))
+    out, err = rec.get("OUTPUT_FILE"), rec.get("ERROR_FILE")
+    log_block("stdout", out, args.lines)
+    if err and err != out:
+        log_block("stderr", err, args.lines, err=True)
+    if st == "RUN" and out and os.path.exists(out):
+        last = max(os.path.getmtime(p) for p in (out, err) if p and os.path.exists(p))
+        if time.time() - last > 3600 and cpu is not None and run and cpu / run < 0.05:
+            print(yellow(f"  no log output for {dur(time.time() - last)} and almost no CPU: stuck?"))
+
+    # files
+    if not args.no_files and start:
+        others = [r for r in run_json(["bjobs", "-json", "-o", "jobid stat exec_cwd"]).get("RECORDS", [])
+                  if r.get("STAT") == "RUN" and r.get("JOBID") != rec["JOBID"]
+                  and r.get("EXEC_CWD") == rec.get("EXEC_CWD")]
+        files_section(rec, start, finish)
+        if others:
+            print(dim(f"  ({len(others)} other running job(s) share this working dir; some files may be theirs)"))
+
+    print("\n" + dim(f"  bjstat {full_id} -F  follow logs live   ·   bdone {full_id}  wait for it"
+                     + (f"   ·   bkill {full_id}" if st in ("RUN", "PEND") else "")))
+    return rec
+
+
+def array_card(jid, recs):
+    stats = Counter(r.get("STAT") for r in recs)
+    name = recs[0].get("JOB_NAME", "").split("[")[0]
+    print(f"{bold(jid)}  {bold(cyan(name))}  array of {len(recs)}: " +
+          ", ".join(f"{n} {s}" for s, n in stats.most_common()))
+    rows = []
+    for r in sorted(recs, key=lambda r: int(r.get("JOBINDEX") or 0)):
+        rows.append([f"[{r.get('JOBINDEX')}]", r.get("STAT", ""), dur(parse_secs(r.get("RUN_TIME"))),
+                     gb(parse_mem_gb(r.get("MAX_MEM"))), r.get("EXIT_CODE") or "",
+                     (r.get("EXIT_REASON") or "")[:30]])
+    show = [x for x in rows if x[1] not in ("DONE",)][:30] or rows[:10]
+    print(table(show, ["idx", "stat", "run", "max mem", "exit", "reason"]))
+    if len(show) < len(rows):
+        print(dim(f"  ({len(rows) - len(show)} more, mostly DONE)"))
+    print(dim(f"\n  bjstat {jid}[N] for one element"))
+    return recs[0]
+
+
+def follow(jid, args):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+    rec = (job_records(jid) or [None])[0] or bhist_record(jid, False)
+    if not rec:
+        sys.exit(f"bjstat: job {jid} not found")
+    held, done_out = {"out": [], "err": []}, set()
+
+    def emit(kind, l):
+        """Print a log line; hold blank/dash lines until we know they aren't LSF's report header."""
+        if kind in done_out:
+            return
+        if l.startswith("Sender: LSF System"):
+            held[kind] = []
+            done_out.add(kind)
+            print(dim(f"{kind}│ (LSF job report trimmed — bjstat {jid} for the summary)"))
+            return
+        if not l.strip() or set(l.strip()) <= {"-"}:
+            held[kind].append(l)
+            return
+        for h in held[kind]:
+            print((red("err│ ") if kind == "err" else dim("out│ ")) + h)
+        held[kind] = []
+        print((red("err│ ") if kind == "err" else dim("out│ ")) +
+              (red(l) if kind == "err" and ERR_PAT.search(l) else l), flush=True)
+
+    files = [(rec.get("OUTPUT_FILE"), "out"), (rec.get("ERROR_FILE"), "err")]
+    if files[0][0] == files[1][0]:
+        files = files[:1]
+    print(bold(f"{jid} {rec.get('JOB_NAME', '')}") + dim(f"  following {', '.join(short_dir(p or '?') for p, _ in files)} — Ctrl-C to stop"))
+    pos = {}
+    for p, _ in files:
+        lines = tail_lines(p, args.lines) if p else None
+        for l in lines or []:
+            emit(_, l)
+        try:
+            pos[p] = os.path.getsize(p)
+        except (OSError, TypeError):
+            pos[p] = 0
+    last_check, state = 0, rec.get("STAT")
+    try:
+        while True:
+            for p, kind in files:
+                if not p:
+                    continue
+                try:
+                    size = os.path.getsize(p)
+                except OSError:
+                    continue
+                if size < pos.get(p, 0):
+                    pos[p] = 0
+                if size > pos.get(p, 0):
+                    with open(p, "rb") as f:
+                        f.seek(pos[p])
+                        chunk = f.read(size - pos[p]).decode(errors="replace")
+                    pos[p] = size
+                    for l in chunk.splitlines():
+                        emit(kind, l.rsplit("\r", 1)[-1])
+            if time.time() - last_check > 15:
+                last_check = time.time()
+                r = job_records(jid)
+                state = r[0].get("STAT") if r else "DONE?"
+                if state in ("DONE", "EXIT", "DONE?"):
+                    time.sleep(2)
+                    # drain anything written at the very end, then stop
+                    for p, kind in files:
+                        try:
+                            size = os.path.getsize(p)
+                            if size > pos.get(p, 0):
+                                with open(p, "rb") as f:
+                                    f.seek(pos[p]); rest = f.read().decode(errors="replace")
+                                for l in rest.splitlines():
+                                    emit(kind, l)
+                        except (OSError, TypeError):
+                            pass
+                    code = r[0].get("EXIT_CODE") if r else ""
+                    col = green if state == "DONE" else red
+                    print(col(f"── job {jid} {state}" + (f", exit {code}" if code else "") + " ──"))
+                    return
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+
+
+def peek(jid, rows, cols):
+    """bjpick's live preview: the compact card (rebuilt every call; ~0.1 s)
+    on top, then the tails of stdout/stderr wrapped to `cols`, fitted into `rows` lines."""
+    import io, textwrap, contextlib
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cf = os.path.join(CACHE_DIR, f"peek-{re.sub(r'[^0-9]', '_', jid)}.txt")
+    try:
+        fresh = False      # the card costs ~0.1 s, so rebuild it on every refresh (live time/resources)
+    except OSError:
+        fresh = False
+    if fresh:
+        card = open(cf).read()
+    else:
+        buf = io.StringIO()
+        ns = argparse.Namespace(compact=True, no_files=True, lines=0, deep=False)
+        with contextlib.redirect_stdout(buf):
+            rec_ = job_card(jid, ns)
+        card = buf.getvalue()
+        with open(cf + ".tmp", "w") as f:
+            f.write(card)
+        os.replace(cf + ".tmp", cf)
+        for old in glob(os.path.join(CACHE_DIR, "peek-*.txt")):   # tidy up old ones
+            try:
+                if time.time() - os.path.getmtime(old) > 86400:
+                    os.remove(old)
+            except OSError:
+                pass
+    card_lines = card.rstrip("\n").splitlines()
+    while card_lines and not card_lines[0].strip():
+        card_lines.pop(0)
+
+    recs = job_records(jid)
+    rec = recs[0] if len(recs) == 1 or "[" in jid else None
+    has_logs = rec and rec.get("STAT") not in ("PEND", "PSUSP") and rec.get("START_TIME") not in (None, "", "-")
+    out, err = (rec.get("OUTPUT_FILE"), rec.get("ERROR_FILE")) if rec else (None, None)
+    logs = ([("stdout", out, False)] + ([("stderr", err, True)] if err and err != out else [])) if has_logs else []
+
+    def height(line):
+        return max(1, -(-vlen(line) // max(1, cols)))
+    # logs get at least 8 rows (if there are logs); the card gets the rest
+    log_rows = min(max(8, rows // 2), rows) if logs else 0
+    card_room = rows - log_rows
+    used, shown = 0, []
+    for l in card_lines:
+        h = height(l)
+        if used + h > card_room - (1 if logs else 0):
+            shown.append(dim("  …"))
+            used += 1
+            break
+        shown.append(l); used += h
+    print("\n".join(shown))
+    if not logs:
+        return
+    body = rows - used - 1 - len(logs) - 1      # blank line + one header per log
+    tails = []
+    for name, path, is_err in logs:
+        wrapped = []
+        for l in tail_lines(path, 400) or []:
+            wrapped += textwrap.wrap(l, max(20, cols - 1), replace_whitespace=False, drop_whitespace=False) or [""]
+        tails.append(wrapped)
+    if len(tails) == 2:
+        n_err = min(len(tails[1]), max(3, int(body * 0.4)))
+        n_out = max(1, body - n_err)
+        if len(tails[0]) < n_out:
+            n_out = len(tails[0])
+            n_err = min(len(tails[1]), body - n_out)
+        quota = [n_out, n_err]
+    else:
+        quota = [body]
+    print()
+    for (name, path, is_err), lines, q in zip(logs, tails, quota):
+        try:
+            stt = os.stat(path)
+            meta = f"{hbytes(stt.st_size)} · last write {ago_s(stt.st_mtime)} · live"
+        except (OSError, TypeError):
+            meta = "not there yet"
+        print(dim(f"── {name} · {meta} " + "─" * max(0, cols - len(name) - len(meta) - 9)))
+        for l in lines[-q:] if q > 0 else []:
+            print(red(l) if is_err and ERR_PAT.search(l) else l)
+
+
+def job_main(argv):
+    ap = argparse.ArgumentParser(prog="bjstat JOBID", add_help=False)
+    ap.add_argument("job")
+    ap.add_argument("-F", "--follow", action="store_true")
+    ap.add_argument("-w", "--watch", type=int)
+    ap.add_argument("-n", "--lines", type=int, default=12)
+    ap.add_argument("--no-files", action="store_true")
+    ap.add_argument("--deep", action="store_true")
+    ap.add_argument("--peek", nargs=2, type=int, metavar=("ROWS", "COLS"))
+    ap.add_argument("--compact", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args(argv)
+    if args.help:
+        print(JOB_HELP); return
+    if args.peek:
+        peek(args.job, *args.peek); return
+    if args.follow:
+        follow(args.job, args); return
+    if not args.watch:
+        job_card(args.job, args); return
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            rec = job_card(args.job, args)
+            if not rec or rec.get("STAT") in ("DONE", "EXIT"):
+                break
+            print(dim(f"  refreshing every {args.watch}s — Ctrl-C to quit"))
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print()
+
+
+def main():
+    # single-job mode when a job id appears anywhere (not as the value of -w/-n/-u/...)
+    argv = sys.argv[1:]
+    takes_value = {"-w", "--watch", "-n", "--lines", "-u", "--user", "-J", "--name", "-g",
+                   "--group-by", "-f", "--from"}
+    ids = [i for i, a in enumerate(argv) if re.fullmatch(r"\d+(\[\d+\])?", a)
+           and not (i > 0 and argv[i - 1] in takes_value)]
+    if ids:
+        i = ids[0]
+        job_main([argv[i]] + argv[:i] + argv[i + 1:])
+        return
+    if any(a in ("-F", "--follow") for a in argv):
+        sys.exit("bjstat: -F follows one job's logs: bjstat -F JOBID (or bjstat JOBID -F)")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-l", "--long", action="store_true", help="list every running/pending job")
+    ap.add_argument("-J", "--name", help="only jobs whose name matches this glob, e.g. 'tsb*'")
+    ap.add_argument("-u", "--user", help="user (default: you)")
+    ap.add_argument("-g", "--group-by", choices=["prefix", "name", "basename"], default="prefix",
+                    help="prefix: text before the first '.' (digits masked otherwise) [default]; "
+                         "name: full job name; basename: name with any path removed")
+    ap.add_argument("-w", "--watch", type=int, metavar="SECS", help="refresh every SECS seconds")
+    ap.add_argument("--no-queues", action="store_true", help="skip the bqueues cluster summary")
+    ap.add_argument("--no-tips", action="store_true", help="hide the advice lines")
+    ap.add_argument("-f", "--from", dest="from_", metavar="TEXT",
+                    help="only jobs whose submit dir, Claude session title/name or session id "
+                         "contains TEXT; 'here' = submitted from this dir or this Claude session")
+    ap.add_argument("--no-origin", action="store_true",
+                    help="skip looking up where jobs came from (bjobs -env per job; cached)")
+    ap.add_argument("--explain", action="store_true",
+                    help="print a glossary of LSF states, terms, bjstat columns and handy commands")
+    args = ap.parse_args()
+    if args.explain:
+        print(GLOSSARY.strip("\n"))
+        return
+
+    if not args.watch:
+        report(args)
+        return
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            report(args)
+            print(dim(f"\n  refreshing every {args.watch}s — Ctrl-C to quit"))
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()

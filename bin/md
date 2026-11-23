@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# md: render Markdown in the terminal.
+#   md FILE        render (paged if longer than the screen)
+#   cmd | md       render stdin
+#   md -w FILE     re-render whenever FILE changes (e.g. while Claude edits a README)
+#   md -r FILE     use Python rich instead of mdcat
+# Uses mdcat (headings, tables, code highlighting; images via kitty graphics outside zellij).
+
+set -u
+MDCAT=${MDCAT:-$(command -v mdcat || echo mdcat)}
+rich=0; watch=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -w) watch=1; shift ;;
+    -r) rich=1; shift ;;
+    -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit ;;
+    *) break ;;
+  esac
+done
+f=${1:--}
+[[ $f == - || -f $f ]] || { echo "md: no such file: $f" >&2; exit 1; }
+if [[ $f == - ]]; then          # buffer stdin (the rich path's python reads its script from stdin)
+  mkdir -p "$HOME/.cache/md"; tmp=$(mktemp "$HOME/.cache/md/stdin.XXXXXX.md")
+  trap 'rm -f "$tmp"' EXIT
+  cat > "$tmp"; f=$tmp
+fi
+
+render() {  # $1 = file or -, $2 = 1 to page
+  local cols; cols=$(tput cols 2>/dev/null || echo 100)
+  if [[ $rich == 0 && -x $MDCAT ]]; then
+    if [[ $2 == 1 ]]; then "$MDCAT" --columns "$cols" "$1" | less -RFX
+    else "$MDCAT" --columns "$cols" "$1"; fi
+  else
+    python3 - "$1" "$cols" "$2" <<'EOF'
+import sys
+from rich.console import Console
+from rich.markdown import Markdown
+src = open(sys.argv[1]).read()
+con = Console(width=int(sys.argv[2]))
+if sys.argv[3] == "1":
+    with con.pager(styles=True):
+        con.print(Markdown(src))
+else:
+    con.print(Markdown(src))
+EOF
+  fi
+}
+
+if [[ $watch == 1 ]]; then
+  [[ $f == - ]] && { echo "md -w needs a file" >&2; exit 1; }
+  last=""
+  trap 'echo; exit 0' INT
+  while :; do
+    stamp="$(stat -c %Y "$f" 2>/dev/null) $(tput cols)x$(tput lines)"
+    if [[ $stamp != "$last" ]]; then
+      clear; render "$f" 0
+      printf '\n\033[2m%s — watching for changes (ctrl-c to stop)\033[0m' "$f"
+      last=$stamp
+    fi
+    sleep 1
+  done
+fi
+
+if [[ -t 1 ]]; then render "$f" 1; else render "$f" 0; fi

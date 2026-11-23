@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# bdone — wait for LSF jobs to finish, then print one summary line each (and why failures died).
+# Replaces hand-rolled `until [ -z "$(bjobs ... | grep -E 'RUN|PEND')" ]; do sleep 60; done` loops.
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+bdone [options] JOBID... | -J 'name*' | -F FILE
+
+  JOBID...   job ids (array ids cover all elements)
+  -J PAT     job-name pattern (LSF wildcard), e.g. 'mapcap.*'
+  -F FILE    take ids from FILE (any 'Job <123>' or bare numbers)
+  -T SECS    give up after SECS (exit 3); default: wait forever (run me in the background)
+  -n         no wait: just summarise now
+  -k N       show last N lines of .err for failed jobs (default 5; 0 = none)
+
+Exit: 0 all DONE, 1 some EXIT, 3 timed out (still running), 2 usage / nothing found.
+Flags MEMLIMIT / RUNLIMIT kills and shows max mem used vs. requested.
+EOF
+}
+
+pat=""; file=""; tmo=0; nowait=0; tailn=5
+while getopts ":J:F:T:k:nh" o; do
+  case $o in J) pat=$OPTARG ;; F) file=$OPTARG ;; T) tmo=$OPTARG ;; k) tailn=$OPTARG ;;
+             n) nowait=1 ;; h) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+done
+shift $((OPTIND-1))
+ids=("$@")
+if [[ -n $file ]]; then   # 'Job <123>' (bsub output) if present, else every bare integer token
+  if grep -q 'Job <[0-9]' "$file"; then fids=$(grep -oE 'Job <[0-9]+>' "$file" | tr -dc '0-9\n')
+  else fids=$(tr -s ' ,\t' '\n' < "$file" | grep -xE '[0-9]+'); fi
+  mapfile -t -O "${#ids[@]}" ids < <(grep . <<<"$fids")
+fi
+[[ ${#ids[@]} -gt 0 || -n $pat ]] || { usage >&2; exit 2; }
+
+sel=(); [[ -n $pat ]] && sel=(-J "$pat")
+F="jobid jobindex stat exit_code max_mem memlimit run_time exit_reason job_name error_file delimiter='|'"
+q() { bjobs -a -noheader -o "$F" "${sel[@]}" "${ids[@]}" 2>/dev/null | grep '|'; }
+
+start=$SECONDS; nap=15; last=""
+while :; do
+  rows=$(q)
+  [[ -n $rows ]] || { echo "bdone: no such jobs (finished >1h ago? try bhist -l ID)" >&2; exit 2; }
+  active=$(awk -F'|' '$3!="DONE" && $3!="EXIT"' <<<"$rows" | wc -l)
+  (( active == 0 || nowait )) && break
+  if (( tmo && SECONDS - start >= tmo )); then break; fi
+  now=$(awk -F'|' '{c[$3]++} END{for(s in c) printf "%s=%d ", s, c[s]}' <<<"$rows")
+  [[ $now != "$last" ]] && { echo "bdone: $(date +%H:%M) $now" >&2; last=$now; }
+  sleep "$nap"; (( nap < 120 )) && nap=$((nap+15))
+done
+
+awk -F'|' '{c[$3]++} END{printf "bdone: "; for(s in c) printf "%s=%d ", s, c[s]; print ""}' <<<"$rows"
+printf '%-9s %-5s %-5s %-4s %-12s %-6s %-9s %-14s %s\n' JOBID IDX STAT EXIT MAXMEM REQ RUNTIME REASON NAME
+nfail=0
+while IFS='|' read -r id idx st ec mx ml rt why nm err; do
+  rt=${rt% second(s)}; if [[ $rt =~ ^[0-9]+$ ]]; then
+    if (( rt < 60 )); then rt=${rt}s; else rt=$(printf '%dh%02dm' $((rt/3600)) $((rt%3600/60))); fi
+  fi
+  case $why in *MEMLIMIT*|*"memory limit"*) why=MEMLIMIT ;; *RUNLIMIT*|*"run limit"*) why=RUNLIMIT ;; esac
+  printf '%-9s %-5s %-5s %-4s %-12s %-6s %-9s %-14s %s\n' "$id" "$idx" "$st" "$ec" "$mx" "$ml" "$rt" "${why:0:14}" "$nm"
+  if [[ $st == EXIT ]]; then
+    nfail=$((nfail+1))
+    if (( tailn > 0 && nfail <= 10 )) && [[ $err != - && -f ${err/\%I/$idx} ]]; then
+      tail -n "$tailn" "${err/\%I/$idx}" | sed 's/^/    | /'
+    fi
+  fi
+done <<<"$rows"
+active=$(awk -F'|' '$3!="DONE" && $3!="EXIT"' <<<"$rows" | wc -l)
+(( active )) && exit 3
+(( nfail )) && exit 1
+exit 0

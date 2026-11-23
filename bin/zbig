@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# zbig CMD [ARGS...]: grow this zellij floating pane, then run CMD.
+# For keybindings: zellij 0.42's Run can't size a floating pane, so the pane resizes itself.
+# ZBIG_GEOM="x y width height" (default "2% 3% 96% 92%"). Outside zellij it just runs CMD.
+if [[ -n ${ZELLIJ_PANE_ID:-} ]]; then
+  read -r gx gy gw gh <<< "${ZBIG_GEOM:-2% 3% 96% 92%}"
+  zellij action change-floating-pane-coordinates --pane-id "terminal_$ZELLIJ_PANE_ID" \
+    -x "$gx" -y "$gy" --width "$gw" --height "$gh" >/dev/null 2>&1
+  sleep 0.15
+fi
+exec "$@"

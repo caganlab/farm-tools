@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# bq — bsub with sensible defaults. Prints ONLY the job id on stdout, so:  j=$(bq -m 16G -n 8 -- cmd)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+bq [options] -- COMMAND...        (or: bq [options] 'cmd | with pipes; and more')
+
+  -m MEM    memory: 16G, 500M, 16000 (=MB)       default 4G
+  -n N      cores (span[hosts=1] always set)     default 1
+  -t TIME   run limit: 30m, 4h, 2d, 1:30 (h:m)   picks queue: <=12h normal, <=48h long,
+                                                 <=7d week, else basement        default normal, no -W
+                                                 (set BQ_QUEUES for other sites, see README)
+  -q QUEUE  explicit queue (overrides -t's choice; e.g. transfer, hugemem)
+  -J NAME   job name                             default: first word of COMMAND
+  -a SPEC   job array, e.g. 1-100 or 1-100%20 (use $LSB_JOBINDEX in COMMAND)
+  -w DEP    dependency: bare ids '123 124' -> done(123)&&done(124); or raw LSF expr 'ended(123)'
+  -l MODS   module load these first, e.g. 'samtools/1.20--h50ea8bc_0 minimap2/2.28--he4a0461_1'
+  -d DIR    log dir                              default ./logs  (NAME.%J[.%I].out/.err)
+  -B ARGS   extra raw bsub args, e.g. -B '-G mygroup -env all'
+  -x        dry run: print the bsub command, don't submit
+  -h        this help
+
+COMMAND runs under bash with pipefail. Logs and job id go to stderr/stdout respectively.
+Wait for results with:  bdone $j     (see bdone -h)
+EOF
+}
+
+mem=4G; ncpu=1; tlim=""; queue=""; name=""; arr=""; dep=""; mods=""; logdir=logs; extra=""; dry=0
+while getopts ":m:n:t:q:J:a:w:l:d:B:xh" o; do
+  case $o in
+    m) mem=$OPTARG ;; n) ncpu=$OPTARG ;; t) tlim=$OPTARG ;; q) queue=$OPTARG ;;
+    J) name=$OPTARG ;; a) arr=$OPTARG ;; w) dep=$OPTARG ;; l) mods=$OPTARG ;;
+    d) logdir=$OPTARG ;; B) extra=$OPTARG ;; x) dry=1 ;; h) usage; exit 0 ;;
+    :) echo "bq: -$OPTARG needs a value" >&2; exit 2 ;;
+    *) echo "bq: unknown option -$OPTARG" >&2; usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND-1))
+[[ ${1:-} == -- ]] && shift
+[[ $# -gt 0 ]] || { echo "bq: no command given" >&2; usage >&2; exit 2; }
+
+# command: one arg = shell string as-is; several args = quote each
+if [[ $# -eq 1 ]]; then cmd=$1; else cmd=$(printf '%q ' "$@"); fi
+
+# memory -> MB
+m=${mem^^}; m=${m%B}
+case $m in
+  *T) mb=$(awk -v x="${m%T}" 'BEGIN{printf "%d", x*1000000}') ;;
+  *G) mb=$(awk -v x="${m%G}" 'BEGIN{printf "%d", x*1000}') ;;
+  *M) mb=$(awk -v x="${m%M}" 'BEGIN{printf "%d", x}') ;;
+  *[!0-9]*|"") echo "bq: bad memory '$mem'" >&2; exit 2 ;;
+  *) mb=$m ;;
+esac
+
+# run limit -> minutes, queue
+W=""
+if [[ -n $tlim ]]; then
+  case $tlim in
+    *:*) mins=$(( 10#${tlim%%:*} * 60 + 10#${tlim##*:} )) ;;
+    *d) mins=$(( ${tlim%d} * 1440 )) ;;
+    *h) mins=$(( ${tlim%h} * 60 )) ;;
+    *m) mins=${tlim%m} ;;
+    *[!0-9]*) echo "bq: bad time '$tlim'" >&2; exit 2 ;;
+    *) mins=$tlim ;;
+  esac
+  W=$(printf '%d:%02d' $((mins/60)) $((mins%60)))
+  if [[ -z $queue ]]; then
+    # BQ_QUEUES = "queue:maxminutes ... lastqueue", shortest first (default: Sanger farm queues)
+    for qm in ${BQ_QUEUES:-normal:720 long:2880 week:10080 basement}; do
+      queue=${qm%%:*}
+      [[ $qm == *:* ]] && (( mins > ${qm#*:} )) && continue
+      break
+    done
+  fi
+fi
+queue=${queue:-${BQ_DEFAULT_QUEUE:-normal}}
+
+# name
+if [[ -z $name ]]; then
+  first=${cmd%% *}; name=$(basename -- "${first%%;*}"); name=${name//[^A-Za-z0-9_.-]/_}
+fi
+
+# dependency: bare ids -> done(a)&&done(b)
+if [[ -n $dep && $dep =~ ^[0-9\ ,]+$ ]]; then
+  dep=$(tr ', ' '\n\n' <<<"$dep" | awk 'NF{printf "%sdone(%s)", (n++?"&&":""), $1}')
+fi
+
+case $PWD in /tmp*|/var/tmp*) echo "bq: warning: cwd $PWD is node-local; the job will start in the node's own /tmp and logs/outputs here won't appear. Submit from lustre." >&2 ;; esac
+mkdir -p "$logdir"; logdir=$(cd "$logdir" && pwd)
+if [[ -n $arr ]]; then jname="$name[$arr]"; lp="$logdir/$name.%J.%I"; else jname=$name; lp="$logdir/$name.%J"; fi
+
+script="set -o pipefail"
+[[ -n $mods ]] && script+="; source /etc/profile.d/modules.sh; module load ${mods//,/ }"
+script+="
+$cmd"
+# POSIX single-quote for dash (LSF job files run under /bin/sh)
+q=${script//\'/\'\\\'\'}
+
+args=(-q "$queue" -n "$ncpu" -M "$mb"
+      -R "select[mem>$mb] rusage[mem=$mb] span[hosts=1]"
+      -J "$jname" -o "$lp.out" -e "$lp.err")
+[[ -n $W ]]   && args+=(-W "$W")
+[[ -n $dep ]] && args+=(-w "$dep")
+# shellcheck disable=SC2206
+[[ -n $extra ]] && args+=($extra)
+
+if (( dry )); then
+  printf 'bsub'; printf ' %q' "${args[@]}"; printf " bash -c '%s'\n" "$q"; exit 0
+fi
+
+out=$(bsub "${args[@]}" "bash -c '$q'" 2>&1) || { echo "$out" >&2; exit 1; }
+id=$(grep -o 'Job <[0-9]*>' <<<"$out" | head -1 | tr -dc 0-9)
+[[ -n $id ]] || { echo "$out" >&2; exit 1; }
+echo "bq: $id $jname q=$queue n=$ncpu mem=${mb}M${W:+ W=$W} log=${lp/\%J/$id}.out" >&2
+echo "$id"

@@ -1,0 +1,20 @@
+// Paste inside the `keybinds { ... }` block of ~/.config/zellij/config.kdl (zellij 0.42+).
+// Alt b opens the LSF job picker as a floating pane; Alt i opens the figure browser,
+// grown to nearly full screen by zbig (zellij's Run can't size floating panes itself).
+// Detach and reattach the session for new bindings to load.
+locked {
+    bind "Alt b" {
+        Run "bjpick" {
+            floating true
+            close_on_exit true
+            name "jobs"
+        }
+    }
+    bind "Alt i" {
+        Run "zbig" "figs" {
+            floating true
+            close_on_exit true
+            name "figs"
+        }
+    }
+}

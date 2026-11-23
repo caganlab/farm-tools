@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# figs: browse the figures in a project, newest first, previewed in the terminal with viu.
+#
+#   figs [DIR]            fzf list of PNG/JPG/GIF/SVG/PDF changed in the last 7 days under DIR
+#                         (default: the git repo you're in, else this dir), with a viu preview
+#     enter                 view the figure full-screen (any key returns to the list)
+#     tab                   mark several
+#     ctrl-o / alt-enter    print the marked (or current) paths and quit, e.g. cp $(figs) ~/out/
+#     ctrl-y                copy the path to your clipboard (OSC 52, works through ssh and zellij)
+#     ctrl-r                rescan
+#     ctrl-/                hide or show the preview
+#   figs -d N [DIR]       last N days instead of 7     figs -a [DIR]   any age
+#   figs ls [DIR]         the plain list, no fzf
+#   figs show FILE...     draw figures full-width right here
+#   figs -w [FILE|DIR]    watch: redraw FILE whenever it changes. Given a dir (or nothing),
+#                         always show the newest figure written there, so you can watch a plot
+#                         while Claude iterates on it. Ctrl-C to stop.
+#
+# PDFs show their first page (pdftoppm), SVGs go through inkscape; both are cached in
+# ~/.cache/figs. Symlinks are followed and .gitignore is ignored, so results/ dirs count.
+# Drawing: figs asks the terminal what it supports. Ghostty/kitty get full-resolution kitty
+# images (outside zellij), sixel terminals get sixel (also inside zellij), everything else
+# (Alacritty, Terminal.app, …) chafa's text rendering. FIGS_MODE=kitty|sixel|symbols|blocks
+# overrides the detection.
+
+set -u
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/figs
+mkdir -p "$CACHE"
+VIU=${FIGS_VIU:-viu -b}
+CHAFA=$(command -v chafa || { c=${FIGS_CHAFA:-}; [[ -x $c ]] && echo $c; })
+# How to draw: sixel | kitty | symbols | blocks. Unless FIGS_MODE is set, ask the terminal:
+# a kitty-graphics query plus the device-attributes query (DA1, which every terminal answers;
+# a ";4" in it means sixel). Ghostty/kitty -> kitty; WezTerm/iTerm2/foot/Windows Terminal ->
+# sixel; Alacritty, Terminal.app, ... -> chafa's text mode. Inside zellij the kitty query is
+# swallowed, and zellij reports sixel only if the outer terminal has it.
+probe_mode() {
+  local old resp="" ch
+  { exec 3<>/dev/tty; } 2>/dev/null || { echo symbols; return; }
+  old=$(stty -g <&3 2>/dev/null) || { exec 3>&-; echo symbols; return; }
+  stty raw -echo <&3
+  printf '\e_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\e\\\e[c' >&3
+  while IFS= read -r -s -n1 -t 1 ch <&3; do
+    resp+=$ch
+    [[ $resp =~ $'\e'\[\?[0-9\;]*c$ ]] && break      # DA1 reply ends the exchange
+  done
+  stty "$old" <&3; exec 3>&-
+  if [[ $resp == *"_Gi=31;OK"* ]]; then echo kitty
+  elif [[ $resp =~ \[\?[0-9\;]*\;4(\;[0-9\;]*)?c ]]; then echo sixel
+  else echo symbols; fi
+}
+if [[ -z ${FIGS_MODE:-} ]]; then
+  case "${1:-}" in
+    __*|ls|list|-h|--help|help) FIGS_MODE=symbols ;;    # children/no drawing: never probe
+    *) FIGS_MODE=$(probe_mode) ;;
+  esac
+fi
+export FIGS_MODE      # fzf's preview children must not probe (fzf owns the terminal then)
+EXTS=(-e png -e jpg -e jpeg -e gif -e webp -e bmp -e svg -e pdf)
+EXCL=(-E .git -E .snakemake -E node_modules -E .pixi -E .venv -E venv -E conda -E envs
+      -E site-packages -E target -E .ipynb_checkpoints -E '*.egg-info' -E .cache -E __pycache__)
+SELF=$(readlink -f "$0")
+
+root() {
+  if [[ -n ${1:-} ]]; then readlink -f "$1"
+  else git rev-parse --show-toplevel 2>/dev/null || pwd; fi
+}
+
+# A PNG/JPG/... path viu can read for FILE (converting PDF/SVG once, cached by path+mtime).
+raster() {
+  local f=$1 ext=${1##*.}; ext=${ext,,}
+  case $ext in pdf|svg) ;; *) echo "$f"; return ;; esac
+  local key; key=$(printf '%s %s' "$f" "$(stat -c %Y "$f" 2>/dev/null)" | md5sum | cut -c1-16)
+  local out=$CACHE/$key.png
+  if [[ ! -s $out ]]; then
+    if [[ $ext == pdf ]]; then
+      pdftoppm -png -r 150 -f 1 -l 1 -singlefile "$f" "${out%.png}" 2>/dev/null
+    else
+      inkscape "$f" --export-type=png --export-filename="$out" -w 1400 >/dev/null 2>&1 \
+        || convert -density 150 "$f" "$out" 2>/dev/null
+    fi
+  fi
+  [[ -s $out ]] && echo "$out"
+}
+
+# Kitty graphics, sent as a PNG (Ghostty scales it): a downscaled copy at ~10 px per cell,
+# cached, instead of chafa's raw RGBA (1.4 MB per 80x30 preview; slow over ssh).
+kitty_png() {  # IMG COLS ROWS
+  local img=$1 cols=$2 rows=$3 w h c r tw th key small
+  read -r w h <<< "$(identify -format '%w %h' "${img}[0]" 2>/dev/null)"
+  [[ -n ${w:-} && ${h:-0} -gt 0 ]] || return 1
+  read -r c r <<< "$(awk -v C="$cols" -v R="$rows" -v w="$w" -v h="$h" 'BEGIN{
+      s=C/w; if (2*R/h < s) s=2*R/h; c=int(w*s+0.5); r=int(h*s/2+0.5)
+      print (c<1?1:c), (r<1?1:r) }')"
+  tw=$((c * 10)); th=$((r * 20))
+  if [[ ${img,,} == *.png && $w -le $tw && $(stat -c %s "$img") -lt 300000 ]]; then
+    small=$img
+  else
+    key=$(printf '%s %s %s' "$img" "$(stat -c %Y "$img")" "${tw}x${th}" | md5sum | cut -c1-16)
+    small=$CACHE/k$key.png
+    [[ -s $small ]] || convert "${img}[0]" -resize "${tw}x${th}>" -strip -colors 256 "PNG8:$small" 2>/dev/null \
+      || convert "${img}[0]" -resize "${tw}x${th}>" -strip "PNG:$small" 2>/dev/null || return 1
+  fi
+  printf '\e_Ga=T,f=100,c=%d,r=%d,m=1,q=2\e\\' "$c" "$r"
+  base64 -w0 "$small" | fold -w 4096 | awk '{printf "\033_Gm=1;%s\033\\", $0}'
+  printf '\e_Gm=0\e\\\n'
+}
+
+# Draw FILE fitted inside COLS x ROWS character cells, keeping its aspect ratio.
+# With chafa: FIGS_MODE=sixel or kitty draws real pixels (zellij passes sixel through;
+# kitty graphics doesn't survive zellij); symbols (default) is chafa's sharp text mode.
+# Without chafa, viu half-blocks (viu stretches if given -w and -h, so we pick the width).
+draw() {
+  local f=$1 cols=$2 rows=$3 img wh w h
+  img=$(raster "$f") || true
+  if [[ -z $img ]]; then echo "(can't render ${f##*/})"; return; fi
+  if [[ -n $CHAFA && $FIGS_MODE != blocks ]]; then
+    case $FIGS_MODE in
+      sixel) "$CHAFA" --probe=off -f sixels -s "${cols}x${rows}" --animate=off "$img" ;;
+      kitty) kitty_png "$img" "$cols" "$rows" || "$CHAFA" --probe=off -f kitty -s "${cols}x${rows}" --animate=off "$img" ;;
+      *)     "$CHAFA" --probe=off -f symbols --symbols all --colors full -w 9 \
+                      -s "${cols}x${rows}" --animate=off "$img" ;;
+    esac 2>/dev/null && return
+  fi
+  wh=$(identify -format '%w %h' "${img}[0]" 2>/dev/null) || wh=""
+  read -r w h <<< "$wh"
+  if [[ -n ${w:-} && ${h:-0} -gt 0 ]]; then
+    # one cell = 1 px wide, 2 px tall in half-block mode
+    cols=$(awk -v C="$cols" -v R="$rows" -v w="$w" -v h="$h" \
+      'BEGIN{s=C/w; if (2*R/h < s) s=2*R/h; c=int(w*s); print (c<1?1:c)}')
+  fi
+  $VIU -w "$cols" "$img" 2>/dev/null || echo "(viu failed on ${f##*/})"
+}
+
+ago() {  # epoch -> "5m", "3h", "2d"
+  local s=$(( $(date +%s) - $1 ))
+  if   (( s < 3600 ));  then echo "$((s/60))m"
+  elif (( s < 86400 )); then echo "$((s/3600))h"
+  else echo "$((s/86400))d"; fi
+}
+
+# Rows: path<TAB>  age  size  relative/path   (newest first)
+listing() {
+  local dir=$1 days=$2 within=()
+  [[ $days != all ]] && within=(--changed-within "${days}d")
+  fd -L -I -t f "${EXTS[@]}" "${EXCL[@]}" "${within[@]}" . "$dir" -X stat -c '%Y	%s	%n' 2>/dev/null \
+    | sort -t$'\t' -k1,1nr \
+    | awk -F'\t' -v now="$(date +%s)" -v root="$dir/" '
+        function age(s){ s=now-s; if (s<3600) return int(s/60) "m"; if (s<86400) return int(s/3600) "h"; return int(s/86400) "d" }
+        function hsize(b){ if (b<1024) return b "B"; if (b<1048576) return int(b/1024) "K"; return sprintf("%.1fM", b/1048576) }
+        { p=$3; r=p; if (index(p, root)==1) r=substr(p, length(root)+1)
+          printf "%s\t%5s %6s  %s\n", p, age($1), hsize($2), r }'
+}
+
+newest() {  # newest figure under DIR changed in the last day
+  fd -L -I -t f "${EXTS[@]}" "${EXCL[@]}" --changed-within 1d . "$1" -X stat -c '%Y	%n' 2>/dev/null \
+    | sort -t$'\t' -k1,1nr | head -1 | cut -f2
+}
+
+caption() {
+  local f=$1
+  printf '\e[1m%s\e[0m  \e[2m%s ago, %s\e[0m\n' "$f" "$(ago "$(stat -c %Y "$f")")" "$(du -h "$f" | cut -f1)"
+}
+
+show() {
+  local cols rows f
+  cols=$(tput cols 2>/dev/null || echo 100); rows=$(tput lines 2>/dev/null || echo 40)
+  for f in "$@"; do
+    [[ -f $f ]] || { echo "no such file: $f" >&2; continue; }
+    draw "$f" "$cols" $((rows - 3)); caption "$f"
+  done
+}
+
+watch_fig() {
+  local target=${1:-} dir="" f last="" stamp
+  if [[ -z $target || -d $target ]]; then dir=$(root "$target"); fi
+  trap 'tput cnorm; echo; exit 0' INT TERM
+  tput civis
+  while :; do
+    if [[ -n $dir ]]; then f=$(newest "$dir"); else f=$target; fi
+    if [[ -n $f && -f $f ]]; then
+      stamp="$f $(stat -c %Y "$f") $(tput cols)x$(tput lines)"
+      if [[ $stamp != "$last" ]]; then
+        sleep 0.3   # let the writer finish
+        clear; show "$f"
+        [[ -n $dir ]] && printf '\e[2mwatching %s for new figures (ctrl-c to stop)\e[0m' "$dir" \
+                      || printf '\e[2mwatching for changes (ctrl-c to stop)\e[0m'
+        last=$stamp
+      fi
+    elif [[ -z $last ]]; then
+      clear; echo "waiting for a figure ${dir:+under $dir }..."; last=waiting
+    fi
+    if [[ -n $dir ]]; then sleep "${FIGS_INTERVAL:-5}"; else sleep "${FIGS_INTERVAL:-1}"; fi  # dir scans cost ~1s of Lustre time
+  done
+}
+
+# Kitty images live on a layer above the text, so redrawing text doesn't remove them:
+# delete them all explicitly (no-op in other modes).
+kclear() { [[ $FIGS_MODE == kitty ]] && printf '\e_Ga=d,d=A,q=2\e\\' > "${1:-/dev/stdout}"; return 0; }
+
+osc52() {
+  local b; b=$(printf '%s' "$1" | base64 -w0)
+  printf '\e]52;c;%s\a' "$b" > /dev/tty
+}
+
+listcache() { echo "$CACHE/list-$(printf '%s %s' "$1" "$2" | md5sum | cut -c1-16).tsv"; }
+
+# listing, also saved for next time
+listing_cached() {
+  local lc; lc=$(listcache "$1" "$2")
+  listing "$1" "$2" > "$lc.$$" && mv -f "$lc.$$" "$lc"
+  cat "$lc"
+}
+
+browse() {
+  local dir=$1 days=$2 label lc start=()
+  [[ $days == all ]] && label="any age" || label="last ${days}d"
+  lc=$(listcache "$dir" "$days")
+  # tidy old preview copies now and then
+  ( fd -t f --changed-before 7d . "$CACHE" -X rm -f >/dev/null 2>&1 & )
+  if [[ -s $lc ]]; then
+    # show last time's list at once; swap in a fresh scan when it's done
+    start=(--bind="start:reload-sync('$SELF' __listc '$dir' '$days')")
+    label+=", refreshing"
+  fi
+  { if [[ -s $lc ]]; then cat "$lc"; else listing_cached "$dir" "$days"; fi; } \
+    | fzf --multi --no-sort --reverse --ansi "${start[@]}" \
+      --delimiter=$'\t' --with-nth=2 \
+      --header="$dir ($label) · enter view · tab mark · ctrl-o print · ctrl-y copy path · ctrl-r rescan" \
+      --preview="'$SELF' __preview {1}" \
+      --preview-window='right,60%,border-left' \
+      --bind="enter:execute('$SELF' __full {1})" \
+      --bind="ctrl-y:execute-silent('$SELF' __copy {1})+change-header(copied {1})" \
+      --bind="ctrl-r:reload-sync('$SELF' __listc '$dir' '$days')" \
+      --bind="ctrl-/:toggle-preview" \
+      --bind="ctrl-o:accept,alt-enter:accept" \
+    | cut -f1
+  kclear /dev/tty
+}
+
+days=7; cmd=browse
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -d|--days) days=$2; shift 2 ;;
+    -a|--all) days=all; shift ;;
+    -w|--watch) shift; watch_fig "${1:-}"; exit ;;
+    ls|list) cmd=ls; shift ;;
+    show) shift; show "$@"; exit ;;
+    __preview)
+      kclear; f=$2; caption "$f" | sed 's/^/ /'
+      draw "$f" "${FZF_PREVIEW_COLUMNS:-60}" $(( ${FZF_PREVIEW_LINES:-30} - 2 )); exit ;;
+    __full) kclear /dev/tty; clear; show "$2"; printf '\e[2m(any key)\e[0m'; read -rsn1 < /dev/tty
+            kclear /dev/tty; exit ;;
+    __copy) osc52 "$2"; exit ;;
+    __list) listing "$2" "$3"; exit ;;
+    __listc) listing_cached "$2" "$3"; exit ;;
+    -h|--help|help) awk 'NR>1 && !/^#/{exit} NR>1' "$SELF" | sed 's/^# \{0,1\}//'; exit ;;
+    -*) echo "unknown option $1 (figs --help)" >&2; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+dir=$(root "${1:-}")
+[[ -d $dir ]] || { echo "no such directory: $dir" >&2; exit 1; }
+case $cmd in
+  ls) listing "$dir" "$days" | cut -f2- ;;
+  browse)
+    if [[ ! -t 1 && ! -t 0 ]]; then listing "$dir" "$days" | cut -f1; exit; fi
+    browse "$dir" "$days" ;;
+esac

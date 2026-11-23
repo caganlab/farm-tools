@@ -7,6 +7,8 @@
 # pending reason; time ticks live, memory/CPU are LSF's own samples) plus the tails of
 # stdout and stderr, redrawn every BJPICK_TICK seconds (default 2); the list itself reloads
 # every 30 s so states stay current.
+# When stdout/stderr say little (the job's tools write their own log files), the preview, the
+# full-screen follow and the card also show the newest log file the job wrote in its dirs.
 #
 #   enter      follow the job's stdout+stderr full-screen (bjstat JOBID -F); Ctrl-C returns here
 #   ctrl-k     preview: card only       ctrl-l   preview: card + live logs (default)

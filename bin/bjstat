@@ -1411,6 +1411,19 @@ def job_card(jid, args):
     log_block("stdout", out, args.lines)
     if err and err != out:
         log_block("stderr", err, args.lines, err=True)
+    if not getattr(args, "compact", False):     # quiet logs: the job's own log file, if one turns up
+        said = sum(1 for p in {out, err} if p for l in (tail_lines(p, 10) or [])
+                   if l != "(LSF job report trimmed)")
+        if said < 4:
+            res, _ = side_file(full_id, st == "RUN")
+            if res is None:                     # first look at this job: wait for the scan (≤ ~25 s)
+                side_scan(full_id)
+                res, _ = side_file(full_id, False)
+            if res and res.get("path"):
+                log_block("its own log", res["path"], args.lines)
+                print(dim(f"      ({res.get('why', '')})"))
+            elif res:
+                print(dim("  stdout/stderr say little, and no log file of its own turned up in its dirs"))
     if st == "RUN" and out and os.path.exists(out):
         last = max(os.path.getmtime(p) for p in (out, err) if p and os.path.exists(p))
         if time.time() - last > 3600 and cpu is not None and run and cpu / run < 0.05:
@@ -1456,7 +1469,8 @@ def follow(jid, args):
     rec = (job_records(jid) or [None])[0] or bhist_record(jid, False)
     if not rec:
         sys.exit(f"bjstat: job {jid} not found")
-    held, done_out = {"out": [], "err": []}, set()
+    held, done_out = {"out": [], "err": [], "log": []}, set()
+    said = [0]                                  # real lines seen on stdout/stderr
 
     def emit(kind, l):
         """Print a log line; hold blank/dash lines until we know they aren't LSF's report header."""
@@ -1470,11 +1484,13 @@ def follow(jid, args):
         if not l.strip() or set(l.strip()) <= {"-"}:
             held[kind].append(l)
             return
+        tag = red("err│ ") if kind == "err" else cyan("log│ ") if kind == "log" else dim("out│ ")
         for h in held[kind]:
-            print((red("err│ ") if kind == "err" else dim("out│ ")) + h)
+            print(tag + h)
         held[kind] = []
-        print((red("err│ ") if kind == "err" else dim("out│ ")) +
-              (red(l) if kind == "err" and ERR_PAT.search(l) else l), flush=True)
+        if kind != "log":
+            said[0] += 1
+        print(tag + (red(l) if kind != "out" and ERR_PAT.search(l) else l), flush=True)
 
     files = [(rec.get("OUTPUT_FILE"), "out"), (rec.get("ERROR_FILE"), "err")]
     if files[0][0] == files[1][0]:
@@ -1490,8 +1506,30 @@ def follow(jid, args):
         except (OSError, TypeError):
             pos[p] = 0
     last_check, state = 0, rec.get("STAT")
+    side_checked, side_on = 0, False
+    noted = []
+
+    def add_side():
+        """Quiet stdout/stderr: also follow the log file the job writes itself (see side_scan)."""
+        res, _ = side_file(jid, state in ("RUN", "SSUSP", "USUSP"))
+        path = res and res.get("path")
+        if res and not path and not noted:
+            noted.append(1)
+            print(dim("── stdout/stderr are quiet and no log file of its own turned up in its dirs "
+                      "(its tools may write to the node's /tmp); still watching"))
+        if not path or not os.path.exists(path) or any(path == p for p, _ in files):
+            return False
+        print(cyan(f"── also following its own log: {short_dir(path)}") + dim(f"  ({res.get('why', '')})"))
+        for l in tail_lines(path, args.lines) or []:
+            emit("log", l)
+        pos[path] = os.path.getsize(path)
+        files.append((path, "log"))
+        return True
     try:
         while True:
+            if not side_on and said[0] < 4 and state not in ("PEND", "PSUSP") and time.time() - side_checked > 5:
+                side_checked = time.time()
+                side_on = add_side()
             for p, kind in files:
                 if not p:
                     continue
@@ -1534,6 +1572,93 @@ def follow(jid, args):
         print()
 
 
+# ---------- peek fallback: the job's own log file when stdout/stderr say little ----------
+
+TEXTY = re.compile(r"\.(log|txt|out|err|stdout|stderr|tsv|csv|stats?|summary|report|progress)$|"
+                   r"(^|[._-])(log|stdout|stderr|progress)([._-]|$)", re.I)
+LSF_LOG = re.compile(r"\.(\d+)(?:\.(\d+))?\.(out|err)$")   # NAME.<jobid>[.<index>].out/.err (bq style)
+
+
+def side_cache(jid):
+    return os.path.join(CACHE_DIR, f"side-{re.sub(r'[^0-9]', '_', jid)}.json")
+
+
+def side_scan(jid):
+    """Find the text file this job most likely logs to (run detached by peek; result cached)."""
+    recs = job_records(jid)
+    if not recs:
+        return
+    rec = recs[0]
+    start = parse_time(rec.get("START_TIME"))
+    fin = parse_time(rec.get("FINISH_TIME")) if rec.get("STAT") in ("DONE", "EXIT") else None
+    res = {"t": time.time(), "path": None, "why": ""}
+    if start:
+        cwd = rec.get("EXEC_CWD") or rec.get("SUB_CWD")
+        own = {rec.get("OUTPUT_FILE"), rec.get("ERROR_FILE")}
+        dirs = candidate_dirs(cwd, rec.get("COMMAND") + " " + " ".join(os.path.dirname(p or "") for p in own))
+        jobid, idx = rec.get("JOBID"), rec.get("JOBINDEX") or "0"
+        # words that tie a file to this job: sample names etc. from its logs and command
+        words = set()
+        for p in own:
+            for l in (tail_lines(p, 50) or []) if p else []:
+                words |= set(re.findall(r"[A-Za-z][\w-]{4,}", l))
+        words |= set(re.findall(r"[A-Za-z][\w-]{4,}", (rec.get("COMMAND") or "").split(" ", 2)[-1]))
+        words -= {"bash", "pipefail", "python", "python3", "scripts", "Sender", "System", "Mbytes"}
+        best = None
+        for path, size, mt in files_written(dirs, start, exclude=own):
+            if size <= 0 or (fin and mt > fin + 60):
+                continue
+            base = os.path.basename(path)
+            m = LSF_LOG.search(base)
+            if m and (m.group(1) != jobid or (m.group(2) or "0") != idx):
+                continue                                    # another job's LSF log
+            if not TEXTY.search(base) or size > 2e9:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    if b"\0" in f.read(4096):
+                        continue                            # binary
+            except OSError:
+                continue
+            hits = sum(1 for w in words if w in path)
+            loggy = bool(re.search(r"log|stdout|stderr|progress", base, re.I))
+            if not hits and not loggy:
+                continue                                    # a results table, not a log
+            score = (hits > 0, loggy, mt)
+            if best is None or score > best[0]:
+                best = (score, path, hits)
+        if best:
+            res["path"] = best[1]
+            res["why"] = "named like this job" if best[2] else "newest log-like file in its dirs; may be another job's"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(side_cache(jid) + f".{os.getpid()}", "w") as f:
+        json.dump(res, f)
+    os.replace(side_cache(jid) + f".{os.getpid()}", side_cache(jid))
+
+
+def side_file(jid, running):
+    """Cached result of side_scan; starts a background rescan when stale (60 s while running)."""
+    cf = side_cache(jid)
+    try:
+        res = json.load(open(cf))
+    except (OSError, ValueError):
+        res = None
+    stale = res is None or (running and time.time() - res.get("t", 0) > 60)
+    lock = cf + ".scanning"
+    if stale:
+        try:
+            busy = time.time() - os.path.getmtime(lock) < 60
+        except OSError:
+            busy = False
+        if not busy:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            open(lock, "w").close()
+            subprocess.Popen([sys.executable, os.path.realpath(__file__), jid, "--side-scan"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    return res, (res is None)
+
+
 def peek(jid, rows, cols):
     """bjpick's live preview: the compact card (rebuilt every call; ~0.1 s)
     on top, then the tails of stdout/stderr wrapped to `cols`, fitted into `rows` lines."""
@@ -1566,7 +1691,7 @@ def peek(jid, rows, cols):
         card_lines.pop(0)
 
     recs = job_records(jid)
-    rec = recs[0] if len(recs) == 1 or "[" in jid else None
+    rec = recs[0] if recs and (len(recs) == 1 or "[" in jid) else None
     has_logs = rec and rec.get("STAT") not in ("PEND", "PSUSP") and rec.get("START_TIME") not in (None, "", "-")
     out, err = (rec.get("OUTPUT_FILE"), rec.get("ERROR_FILE")) if rec else (None, None)
     logs = ([("stdout", out, False)] + ([("stderr", err, True)] if err and err != out else [])) if has_logs else []
@@ -1587,14 +1712,33 @@ def peek(jid, rows, cols):
     print("\n".join(shown))
     if not logs:
         return
+    raw = [[l for l in (tail_lines(path, 400) or []) if l != "(LSF job report trimmed)"]
+           for name, path, is_err in logs]
+    # Quiet logs (the job sends its tools' output to files of its own): also show the newest
+    # log-like file it has written. Found by a background scan, so the preview never waits.
+    side = None
+    if sum(len(r) for r in raw) < 4:
+        res, scanning = side_file(jid, rec.get("STAT") in ("RUN", "SSUSP", "USUSP"))
+        if res and res.get("path") and os.path.exists(res["path"]):
+            side = ("its own log: " + short_dir(res["path"]), res["path"], False, res.get("why", ""))
+        elif scanning:
+            side = ("looking for the files it writes…", None, False, "")
+        elif res:
+            side = ("no log file of its own found in its dirs (output on the node's /tmp?)", None, False, "")
+        if side:
+            logs = logs + [side[:3]]
+            raw.append(tail_lines(side[1], 400) or [] if side[1] else [])
     body = rows - used - 1 - len(logs) - 1      # blank line + one header per log
     tails = []
-    for name, path, is_err in logs:
+    for lines_ in raw:
         wrapped = []
-        for l in tail_lines(path, 400) or []:
+        for l in lines_:
             wrapped += textwrap.wrap(l, max(20, cols - 1), replace_whitespace=False, drop_whitespace=False) or [""]
         tails.append(wrapped)
-    if len(tails) == 2:
+    if side:                                    # quiet logs keep their few lines; the side file gets the rest
+        quota = [len(t) for t in tails[:-1]]
+        quota.append(max(0, body - sum(quota)))
+    elif len(tails) == 2:
         n_err = min(len(tails[1]), max(3, int(body * 0.4)))
         n_out = max(1, body - n_err)
         if len(tails[0]) < n_out:
@@ -1609,8 +1753,13 @@ def peek(jid, rows, cols):
             stt = os.stat(path)
             meta = f"{hbytes(stt.st_size)} · last write {ago_s(stt.st_mtime)} · live"
         except (OSError, TypeError):
-            meta = "not there yet"
-        print(dim(f"── {name} · {meta} " + "─" * max(0, cols - len(name) - len(meta) - 9)))
+            meta = None if path is None else "not there yet"
+        if side and path == side[1] and side[3]:
+            meta += f" · {side[3]}"
+        if meta is None:
+            print(dim(f"── {name} " + "─" * max(0, cols - len(name) - 6)))
+        else:
+            print(dim(f"── {name} · {meta} " + "─" * max(0, cols - len(name) - len(meta) - 9)))
         for l in lines[-q:] if q > 0 else []:
             print(red(l) if is_err and ERR_PAT.search(l) else l)
 
@@ -1625,10 +1774,20 @@ def job_main(argv):
     ap.add_argument("--deep", action="store_true")
     ap.add_argument("--peek", nargs=2, type=int, metavar=("ROWS", "COLS"))
     ap.add_argument("--compact", action="store_true")
+    ap.add_argument("--side-scan", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("-h", "--help", action="store_true")
     args = ap.parse_args(argv)
     if args.help:
         print(JOB_HELP); return
+    if args.side_scan:
+        try:
+            side_scan(args.job)
+        finally:
+            try:
+                os.remove(side_cache(args.job) + ".scanning")
+            except OSError:
+                pass
+        return
     if args.peek:
         peek(args.job, *args.peek); return
     if args.follow:

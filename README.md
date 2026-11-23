@@ -55,7 +55,7 @@ started and where, and a diagnosis of the exit), and `bjstat JOBID -F` follows i
 live. `bjstat --explain` is a glossary of LSF terms.
 
 **`bjpick`** is an fzf picker over your jobs with a live preview: the job card plus the tails of its
-logs, redrawn every two seconds. Enter follows the logs full-screen. Bound to a zellij key it gives
+logs, redrawn every two seconds. Enter follows the logs full-screen. If you use zellij, one key gives
 you a pop-up job monitor (see below).
 
 **`figs`** browses the figures (PNG, JPG, SVG, PDF) in a project, newest first, with previews in the

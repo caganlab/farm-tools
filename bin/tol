@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""tol — find a Tree of Life species' data on the farm.
+
+Usage:
+  tol dmAdoAnnu1            card for a ToL id: species, assemblies, reads, k-mer stats, paths
+  tol 'Adonis annua'        ... or a species name (spaces or underscores)
+  tol adonis                ... or part of a name: lists the matches
+  tol -p QUERY              print just the species directory (cd "$(tol -p dmAdoAnnu1)", or: tcd dmAdoAnnu1)
+  tol -f QUERY [WHICH]      print the FASTA of the current release: ref (default), hap1, hap2,
+                            primary, all  — e.g. G=$(tol -f dmAdoAnnu1 hap2)
+  tol -k QUERY              print the k-mer (FastK/GenomeScope) directory
+
+Species are found through /data/tol/data/<project>/<group>/<Genus_species>, which links into
+/lustre/scratch122/tol/data/<6 hex levels>/<Genus_species>. A ToL id encodes the name
+(dm Ado Annu 1 -> Ado*_annu*), so no index is needed. Paths printed are the real Lustre ones.
+"""
+import glob, json, os, re, sys
+
+BASE = os.environ.get("TOL_DATA", "/data/tol/data")
+TTY = sys.stdout.isatty()
+
+
+def c(t, code): return f"\033[{code}m{t}\033[0m" if TTY else str(t)
+def bold(t): return c(t, "1")
+def dim(t): return c(t, "2")
+def cyan(t): return c(t, "36")
+def yellow(t): return c(t, "33")
+
+
+def hsize(b):
+    for u in ("B", "K", "M", "G", "T"):
+        if b < 1024 or u == "T":
+            return f"{b:.0f}{u}" if u in ("B", "K") else f"{b:.1f}{u}"
+        b /= 1024
+
+
+def ls(d):
+    try:
+        return sorted(os.listdir(d))
+    except OSError:
+        return []
+
+
+TOLID = re.compile(r"^([a-z]+)([A-Z][a-z]+)([A-Z][a-z]+)(\d+)$")
+
+
+def species_dirs(pattern):
+    """{realpath: [(project, group, link)]} for species dirs matching a glob on the name."""
+    out = {}
+    for link in glob.glob(os.path.join(BASE, "*", "*", pattern)):
+        parts = link.split("/")
+        proj, group = parts[-3], parts[-2]
+        if proj in ("all",):
+            continue
+        out.setdefault(os.path.realpath(link), []).append((proj, group, link))
+    return out
+
+
+def resolve(q):
+    """-> (realpath, tolid or None, [(proj, group, link)]) or exits with candidates."""
+    q = q.strip().replace(" ", "_")
+    m = TOLID.match(q)
+    if m:
+        genus, sp = m.group(2), m.group(3).lower()
+        hits = species_dirs(f"{genus}*_{sp}*")
+        exact = [p for p in hits if os.path.isdir(os.path.join(p, "genomic_data", q))
+                 or glob.glob(os.path.join(p, "assembly", "*", q + "*"))]
+        pick = exact or list(hits)
+        if len(pick) == 1:
+            return pick[0], q, hits[pick[0]]
+        if not pick:
+            sys.exit(f"tol: no species found for {q} (looked for {genus}*_{sp}* under {BASE})")
+        candidates(pick, hits)
+    hits = species_dirs(q[0].upper() + q[1:] if "_" in q else q)
+    if len(hits) == 1:
+        p = next(iter(hits))
+        return p, None, hits[p]
+    if not hits:   # fragment, case-insensitive
+        rx = re.compile(re.escape(q), re.I)
+        allh = species_dirs("*")
+        hits = {p: v for p, v in allh.items() if rx.search(os.path.basename(p))}
+        if len(hits) == 1:
+            p = next(iter(hits))
+            return p, None, hits[p]
+        if not hits:
+            sys.exit(f"tol: nothing matching '{q}'")
+    candidates(list(hits), hits)
+
+
+def candidates(paths, hits):
+    print(f"{len(paths)} matches:", file=sys.stderr)
+    for p in sorted(paths, key=os.path.basename)[:40]:
+        ids = [d for d in ls(os.path.join(p, "genomic_data")) if TOLID.match(d)]
+        groups = sorted({g for _, g, _ in hits[p]})
+        print(f"  {os.path.basename(p).replace('_', ' '):35} {', '.join(ids)[:40]:40} {dim(', '.join(groups))}",
+              file=sys.stderr)
+    if len(paths) > 40:
+        print(dim(f"  … {len(paths) - 40} more"), file=sys.stderr)
+    sys.exit(1)
+
+
+def releases(sp):
+    """[(name, gca, hap, version, fasta)] from assembly/release, plus the reference target."""
+    rel = os.path.join(sp, "assembly", "release")
+    out = []
+    for n in ls(rel):
+        p = os.path.join(rel, n)
+        m = re.match(r"^(.+?)(?:\.(hap\d|primary|alternate))?\.(\d+)$", n)
+        if not os.path.islink(p) or n.startswith("GCA_") or not m:
+            continue
+        gca = os.readlink(p).rstrip("/").split("/")[-1]
+        fa = sorted(glob.glob(os.path.join(p, "insdc", "*.fa.gz")))
+        out.append((n, gca, m.group(2) or "primary", int(m.group(3)), fa[0] if fa else None))
+    ref = os.path.join(rel, "reference")
+    reftarget = os.readlink(ref).rstrip("/").split("/")[-1] if os.path.islink(ref) else None
+    return out, reftarget
+
+
+def latest(rels):
+    best = {}
+    for r in rels:
+        if r[2] not in best or r[3] > best[r[2]][3]:
+            best[r[2]] = r
+    return best
+
+
+def genomescope(kdir):
+    f = os.path.join(kdir, "fastk_genomescope_summary.txt")
+    vals = {}
+    try:
+        for line in open(f):
+            for key, label in (("Genome Haploid Length", "haploid"), ("Heterozygous (ab)", "het"),
+                               ("Model Fit", "fit")):
+                if line.startswith(key):
+                    vals[label] = line[len(key):].split()[-2:] if label == "haploid" else line[len(key):].split()[-1:]
+    except OSError:
+        return None
+    if not vals:
+        return None
+    hap = vals.get("haploid")
+    hl = f"{int(hap[0].replace(',', '')) / 1e9:.2f} Gb" if hap and hap[0].replace(",", "").isdigit() else "?"
+    def pct(v):
+        try:
+            return f"{float(v.rstrip('%')):.1f}%"
+        except ValueError:
+            return v
+    return f"haploid {hl}, het {pct(vals.get('het', ['?'])[0])}, fit {pct(vals.get('fit', ['?'])[0])}"
+
+
+def kmer_dir(sp, tolid):
+    ids = [tolid] if tolid else [d for d in ls(os.path.join(sp, "genomic_data")) if TOLID.match(d)]
+    for i in ids:
+        for k in sorted(glob.glob(os.path.join(sp, "genomic_data", i, "pacbio", "kmer", "k*")), reverse=True):
+            return k
+    return None
+
+
+def dir_summary(d):
+    files = [f for f in ls(d) if os.path.isfile(os.path.join(d, f))]
+    kinds = {}
+    for f in files:
+        m = re.search(r"\.(bam|cram|fastq\.gz|fq\.gz|fasta\.gz|fa\.gz)$", f)
+        if m:
+            k = m.group(1)
+            n, s = kinds.get(k, (0, 0))
+            try:
+                s += os.path.getsize(os.path.join(d, f))
+            except OSError:
+                pass
+            kinds[k] = (n + 1, s)
+    return ", ".join(f"{n} {k} ({hsize(s)})" for k, (n, s) in kinds.items())
+
+
+def card(sp, tolid, links):
+    name = os.path.basename(sp).replace("_", " ")
+    meta = {}
+    try:
+        meta = json.load(open(os.path.join(sp, "speciesops.json")))
+    except (OSError, ValueError):
+        pass
+    groups = sorted({g for _, g, _ in links})
+    projects = meta.get("projects") or sorted({p for p, _, _ in links})
+    print(bold(cyan(name)) + dim(f"  ({', '.join(groups)} · taxon {meta.get('taxon_id', '?')} · {', '.join(projects)})"))
+    print(f"  {sp}")
+    ids = [d for d in ls(os.path.join(sp, "genomic_data")) if TOLID.match(d)]
+    print(f"  {dim('specimens')}  " + ", ".join(yellow(i) if i == tolid else i for i in ids))
+
+    rels, ref = releases(sp)
+    print("\n" + bold("Release") + (dim(f"  reference → {ref}") if ref else ""))
+    if not rels:
+        print(dim("  none"))
+    best = latest(rels)
+    for hap in sorted(best):
+        n, gca, _, v, fa = best[hap]
+        star = yellow(" ★") if gca == ref else ""
+        size = hsize(os.path.getsize(fa)) if fa and os.path.exists(fa) else ""
+        print(f"  {n:24} {gca:18} {dim(os.path.basename(fa) if fa else '(no fasta)')} {dim(size)}{star}")
+    older = len(rels) - len(best)
+    if older:
+        print(dim(f"  + {older} older release(s)"))
+    cur = ls(os.path.join(sp, "assembly", "curated"))
+    dra = [d for d in ls(os.path.join(sp, "assembly", "draft")) if TOLID.match(d.split(".")[0] or "")]
+    if cur:
+        print(f"  {dim('curated')}   {', '.join(cur[-4:])}")
+    if dra:
+        print(f"  {dim('draft')}     {', '.join(dra[-3:])}")
+
+    print("\n" + bold("Reads"))
+    for i in ids:
+        gd = os.path.join(sp, "genomic_data", i)
+        for tech in ls(gd):
+            s = dir_summary(os.path.join(gd, tech))
+            if s:
+                print(f"  {i:12} {tech:14} {s}")
+    for i in ls(os.path.join(sp, "transcriptomic_data")):
+        for tech in ls(os.path.join(sp, "transcriptomic_data", i)):
+            s = dir_summary(os.path.join(sp, "transcriptomic_data", i, tech))
+            if s:
+                print(f"  {i:12} {tech:14} {s}")
+
+    k = kmer_dir(sp, tolid)
+    if k:
+        gs = genomescope(k)
+        plots = [f for f in ls(k) if f.endswith(".png")]
+        print("\n" + bold("K-mers") + dim(f"  {os.path.basename(k)}"))
+        if gs:
+            print(f"  GenomeScope: {gs}")
+        q = tolid or os.path.basename(sp)
+        print(f"  {k}")
+        print(dim(f"  {len(plots)} plots: figs -a $(tol -k {q})"))
+
+    wk = ls(os.path.join(sp, "working"))
+    if wk:
+        wk.sort(key=lambda d: os.path.getmtime(os.path.join(sp, "working", d)))
+        print("\n" + bold("Working") + dim(f"  {len(wk)} dirs, newest: {wk[-1]}"))
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__); return
+    mode = None
+    if a[0] in ("-p", "-f", "-k"):
+        mode = a.pop(0)
+    if not a:
+        sys.exit("tol: what should I look up?")
+    which = a[1] if mode == "-f" and len(a) > 1 else "ref"
+    q = a[0] if mode == "-f" else " ".join(a)
+    sp, tolid, links = resolve(q)
+    if mode == "-p":
+        print(sp)
+    elif mode == "-k":
+        k = kmer_dir(sp, tolid)
+        print(k) if k else sys.exit("tol: no k-mer directory")
+    elif mode == "-f":
+        rels, ref = releases(sp)
+        best = latest(rels)
+        if which == "all":
+            picks = [r for r in best.values()]
+        elif which == "ref":
+            picks = [r for r in rels if r[1] == ref] or list(best.values())[:1]
+        else:
+            picks = [best[which]] if which in best else []
+        picks = [r[4] for r in picks if r[4]]
+        if not picks:
+            sys.exit(f"tol: no {which} FASTA in {sp}/assembly/release (have: {', '.join(best) or 'none'})")
+        print("\n".join(picks))
+    else:
+        card(sp, tolid, links)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass

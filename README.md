@@ -73,6 +73,125 @@ species directory, `tol -k ID` the k-mer directory. *Note: unlike the other tool
 specific to Sanger's Tree of Life data layout (`/data/tol/data/<project>/<group>/<Genus_species>`)
 and is only useful there. `TOL_DATA` overrides the root if it moves.*
 
+## Examples
+
+The outputs below are real, trimmed, with paths shortened.
+
+**Submit a job with `bq`, wait for it with `bdone`.** `bq` prints only the job id, so you can keep it
+in a variable. `-x` shows the `bsub` it would run instead of submitting:
+
+```console
+$ bq -x -m 16G -n 8 -t 30h -J map -- 'minimap2 -t 8 ref.fa reads.fq.gz > aln.paf'
+bsub -q long -n 8 -M 16000 -R select[mem>16000] rusage[mem=16000] span[hosts=1] -J map
+     -o ./logs/map.%J.out -e ./logs/map.%J.err -W 30:00 bash -c 'set -o pipefail; minimap2 ...'
+
+$ j=$(bq -m 16G -n 8 -t 30h -J map -- 'minimap2 -t 8 ref.fa reads.fq.gz > aln.paf')
+$ bdone $j
+JOBID     IDX   STAT  EXIT MAXMEM       REQ    RUNTIME   REASON         NAME
+642554    0     EXIT  140  330 Mbytes   8 G    1h00m     RUNLIMIT       e2e3.Huperzia_selago
+    | User defined signal 2
+```
+
+Arrays and dependencies: `bq -a 1-100%20 -J chunk -- 'run.sh $LSB_JOBINDEX'`, then
+`bq -w "$j" -J merge -- merge.sh` starts only when job `$j` has finished successfully.
+
+**See all your jobs with `bjstat`:**
+
+```console
+$ bjstat
+  1 running · 3 pending · 3 done · 1 failed   (done/failed = last ~hour)
+  Using 1 cores, 0.1G RAM in use of 8.0G reserved
+
+By job group  (grouped by prefix; -g name for full names)
+  group          run  pend  done  fail  med runtime  fin/hr         ETA  queue
+  assembly         0     3     0     0            -       0  no history  hugemem
+  e2e3             1     0     3     1        7m30s       4      ~4m07s  normal
+
+Why pending
+      3  There are no suitable hosts for the job
+
+Needs attention
+  1 job(s) failed:
+            642554  e2e3.Huperzia_selago  exit 140, TERM_RUNLIMIT: job killed after reaching
+                    LSF run time limit   .../logs/e2e3.Huperzia_selago.642554.err
+
+Resource use of finished jobs  (to right-size the next batch)
+  group  n  med mem  peak mem  requested  cpu eff  suggestion
+  e2e3   3     0.8G      0.8G       8.0G      98%  -M 2G would do
+```
+
+**Look into one job with `bjstat JOBID`** (`-F` follows its logs live instead):
+
+```console
+$ bjstat 642554
+642554  e2e3.Huperzia_selago  EXIT  queue normal  1 core  node-13-27
+
+Time
+  submitted 11:45, waited 1s in the queue
+  started   11:45, ran 1h00m of 1h00m limit  ████████████████████████
+  finished  12:45 (4m51s ago)
+
+Resources
+  memory    max 0.3G, avg 0.1G of 8.0G  █░░░░░░░░░░░░░░░░░░░░░░░  4% efficient
+            next time -M 1G would do (uses < 1/4 of the request)
+  cpu       0.1 of 1 core(s) on average  (11% efficient, peak 1.0)
+
+Exit
+  exit code 140: SIGUSR2 (LSF run-limit warning)
+  TERM_RUNLIMIT: hit the queue's / -W run limit; use a longer queue or checkpoint
+
+Logs
+  stdout: .../logs/e2e3.Huperzia_selago.642554.out  2K, last write 4m52s ago
+  stderr: .../logs/e2e3.Huperzia_selago.642554.err  22B, last write 4m58s ago
+    │ User defined signal 2
+```
+
+**Pick a job with `bjpick`.** Your jobs on the left; on the right, the same card for the highlighted
+job plus the last lines of its stdout and stderr, redrawn every two seconds. Move with the arrow
+keys, type to filter, Enter to follow a job's logs full-screen, Esc to close.
+
+```console
+$ bjpick
+  642901 RUN   normal  8  map.chr1      myproject  │ 642901  map.chr1  RUN  queue normal  8 cores
+> 642554 EXIT  normal  1  e2e3.Huper…   rnaedit    │ Time
+  983557 PEND  hugemem 16 asm.v2        assembly   │   started 11:45, ran 23m of 30h limit  ██░░░
+                                                   │ ── stdout · 2K · last write 3s ago · live ──
+                                                   │ [M::mm_idx_gen] read 1.2 Gbp ...
+```
+
+**Browse figures with `figs`:**
+
+```console
+$ figs                     # figures in this project (git repo or dir), newest first, with previews
+$ figs -w results/         # keep showing the newest figure written under results/
+$ figs show plots/pca.png  # draw one figure right here
+```
+
+**Read Markdown with `md`:** `md README.md`, `md -w notes.md` (re-renders whenever it changes), or
+`some-command | md`.
+
+**Find a species' data with `tol`:**
+
+```console
+$ tol dmAdoAnnu1
+Adonis annua  (dicots · taxon 212759 · darwin, tol)
+  /lustre/scratch122/tol/data/f/6/0/d/d/9/Adonis_annua
+
+Release  reference → GCA_964200825.2
+  dmAdoAnnu1.hap1.2        GCA_964200825.2    GCA_964200825.2.fa.gz 4.2G ★
+  dmAdoAnnu1.hap2.2        GCA_964214385.2    GCA_964214385.2.fa.gz 4.2G
+
+Reads
+  dmAdoAnnu1   hic-arima2     1 cram (284.4G)
+  dmAdoAnnu1   pacbio         12 bam (278.8G)
+
+K-mers  k31
+  GenomeScope: haploid 7.12 Gb, het 26.1%, fit 90.9%
+
+$ minimap2 -x asm5 $(tol -f dmAdoAnnu1 hap1) my_contigs.fa > aln.paf
+$ cd $(tol -p 'Adonis annua')
+```
+
 ## What each tool needs
 
 The installer checks all of this. LSF, Python 3, curl, `pdftoppm` and ImageMagick are already on the

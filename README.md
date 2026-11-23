@@ -75,7 +75,7 @@ and is only useful there. `TOL_DATA` overrides the root if it moves.*
 
 ## Examples
 
-The outputs below are real, trimmed, with paths shortened.
+The outputs below are real (trimmed, paths shortened), except the `bjpick` sketch.
 
 **Submit a job with `bq`, wait for it with `bdone`.** `bq` prints only the job id, so you can keep it
 in a variable. `-x` shows the `bsub` it would run instead of submitting:
@@ -86,7 +86,7 @@ bsub -q long -n 8 -M 16000 -R select[mem>16000] rusage[mem=16000] span[hosts=1] 
      -o ./logs/map.%J.out -e ./logs/map.%J.err -W 30:00 bash -c 'set -o pipefail; minimap2 ...'
 
 $ j=$(bq -m 16G -n 8 -t 30h -J map -- 'minimap2 -t 8 ref.fa reads.fq.gz > aln.paf')
-$ bdone $j
+$ bdone $j        # waits; here for a job that ran out of time
 JOBID     IDX   STAT  EXIT MAXMEM       REQ    RUNTIME   REASON         NAME
 642554    0     EXIT  140  330 Mbytes   8 G    1h00m     RUNLIMIT       e2e3.Huperzia_selago
     | User defined signal 2
@@ -146,7 +146,7 @@ Logs
     │ User defined signal 2
 ```
 
-**Pick a job with `bjpick`.** Your jobs on the left; on the right, the same card for the highlighted
+**Pick a job with `bjpick`.** A sketch of the screen: your jobs on the left; on the right, the same card for the highlighted
 job plus the last lines of its stdout and stderr, redrawn every two seconds. Move with the arrow
 keys, type to filter, Enter to follow a job's logs full-screen, Esc to close.
 

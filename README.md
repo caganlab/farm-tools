@@ -1,9 +1,39 @@
 # hpc-tools
 
-Small terminal tools for working on an LSF cluster over ssh, mostly from inside zellij. They are
-plain bash and Python 3 scripts with no Python packages beyond the standard library, they call no
-web services, and every one of them only reads: none kills, moves or deletes anything. The one
-exception is `bq`, which submits the job you give it.
+Small terminal tools for working on the LSF farm over ssh, mostly from inside zellij. They are
+plain bash and Python 3 scripts (standard library only), they call no web services, and they only
+read: none kills, moves or deletes anything. The one exception is `bq`, which submits the job you
+give it.
+
+The most useful one is probably **the jobs picker, `bjpick`**: a pop-up list of your jobs where the
+highlighted job shows a live card (time against its limit, memory and CPU against what it asked for,
+why it is pending or how it failed) and the tails of its stdout and stderr, updated every two
+seconds. Run it in any shell, or bind it to `Alt b` in zellij.
+
+## Quick start (on the farm)
+
+```bash
+git clone https://github.com/<you>/hpc-tools ~/hpc-tools
+cd ~/hpc-tools
+./install.sh --deps
+```
+
+That links the tools into `~/.local/bin` and downloads anything they need that you don't already
+have (fzf, fd, zellij, mdcat, viu and chafa, as prebuilt Linux binaries, into the same directory; no
+root or compiling). Without `--deps` it only links the tools and lists what is missing. If it says
+`~/.local/bin` is not on your `PATH`, add the line it prints to `~/.bashrc` and open a new shell.
+Then try:
+
+```bash
+bjstat          # summary of your jobs
+bjpick          # the jobs picker; Esc closes, Enter follows a job's logs
+bq -x -m 8G -t 2h -- echo hi    # dry run: shows the bsub command it would submit
+```
+
+Every tool has `-h`. Updating is `git pull` in `~/hpc-tools` (the installed commands are links, so
+they update with it). `./install.sh --uninstall` removes the links. The installer never overwrites a
+command you already have with the same name; it tells you and skips it. Set `PREFIX=/some/dir` to
+install somewhere other than `~/.local/bin`.
 
 ## The tools
 
@@ -46,23 +76,17 @@ and is only useful there. `TOL_DATA` overrides the root if it moves.*
 **`zbig`** is a helper for zellij keybindings: it grows its own floating pane to nearly full screen
 and then runs the command it was given, since zellij's `Run` action cannot size floating panes.
 
-## Install
+## What each tool needs
 
-Clone the repository and put `bin/` on your `PATH`:
-
-```bash
-git clone https://github.com/<you>/hpc-tools ~/hpc-tools
-echo 'export PATH="$HOME/hpc-tools/bin:$PATH"' >> ~/.bashrc
-```
-
-Every tool has `-h`. What each needs:
+The installer checks all of this. LSF, Python 3, curl, `pdftoppm` and ImageMagick are already on the
+farm's head nodes.
 
 | Tool | Needs |
 |------|-------|
 | `bq`, `bdone` | LSF (`bsub`, `bjobs`) |
 | `bjstat` | LSF, Python 3.8+; `fd` for the "files written" section |
-| `bjpick` | LSF, Python 3, `fzf` 0.50+, `curl` (for the live preview) |
-| `figs` | `fzf`, `fd`, and at least one of `chafa` or `viu`; `pdftoppm` for PDFs, `inkscape` or ImageMagick for SVGs |
+| `bjpick` | LSF, Python 3, `fzf` 0.56+, `curl` (for the live preview) |
+| `figs` | `fzf`, `fd`, and `chafa` and/or `viu`; `pdftoppm` for PDFs, `inkscape` or ImageMagick for SVGs |
 | `md` | `mdcat` (or Python `rich` with `md -r`) |
 | `tol` | Python 3; access to the Sanger ToL data tree |
 | `zbig` | zellij 0.42+ |
@@ -85,12 +109,19 @@ sets the size `zbig` grows a pane to.
 If you use Claude Code, `bjstat` also tells you which Claude session submitted each set of jobs, by
 reading the session files under `~/.claude`. Without them that column is simply left out.
 
-## Zellij
+## Zellij keys
 
-`zellij/keybindings.kdl` binds `Alt b` to the job picker and `Alt i` to the figure browser as
-floating panes. Copy its `locked { ... }` block into the `keybinds` section of
-`~/.config/zellij/config.kdl` (use `normal` instead of `locked` if you don't start zellij in locked
-mode), then detach and reattach.
+`zellij/keybindings.kdl` adds two pop-up (floating) panes: `Alt b` for the jobs picker and `Alt e` for
+the figure browser. Neither clashes with zellij's own keys, and they work in every mode. To add them:
+
+1. If you have no `~/.config/zellij/config.kdl` yet, create one with
+   `mkdir -p ~/.config/zellij && zellij setup --dump-config > ~/.config/zellij/config.kdl`.
+2. Paste the `shared { ... }` block from `zellij/keybindings.kdl` inside the `keybinds { ... }` section.
+3. Check it with `zellij setup --check` (it should say "Well defined"), then start a new session or
+   detach and reattach.
+
+On a Mac the terminal must send Option as Alt: in Ghostty add `macos-option-as-alt = true` to its
+config; in iTerm2 set Profiles › Keys › Left Option key to "Esc+".
 
 ## Licence
 

@@ -1,16 +1,22 @@
-// Paste inside the `keybinds { ... }` block of ~/.config/zellij/config.kdl (zellij 0.42+).
-// Alt b opens the LSF job picker as a floating pane; Alt i opens the figure browser,
-// grown to nearly full screen by zbig (zellij's Run can't size floating panes itself).
-// Detach and reattach the session for new bindings to load.
-locked {
+// Zellij keys for the tools (zellij 0.42+). Paste the `shared { ... }` block inside the
+// `keybinds { ... }` section of ~/.config/zellij/config.kdl. If you don't have a config yet:
+//   mkdir -p ~/.config/zellij && zellij setup --dump-config > ~/.config/zellij/config.kdl
+// `shared` means the keys work in every mode, locked included. Detach and reattach the session
+// (or start a new one) for new bindings to load.
+//
+//   Alt b   jobs: pick one of your LSF jobs, live card + log tails (bjpick)
+//   Alt e   figures in the current project (figs), nearly full screen
+// Neither key is used by zellij's defaults. On a Mac, set your terminal's Option key to act as Alt
+// (Ghostty: macos-option-as-alt = true; iTerm2: Profiles > Keys > Left Option = Esc+).
+shared {
     bind "Alt b" {
-        Run "bjpick" {
+        Run "zbig" "bjpick" {
             floating true
             close_on_exit true
             name "jobs"
         }
     }
-    bind "Alt i" {
+    bind "Alt e" {
         Run "zbig" "figs" {
             floating true
             close_on_exit true

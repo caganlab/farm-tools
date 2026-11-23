@@ -1,6 +1,6 @@
 # hpc-tools
 
-Small terminal tools for working on the LSF farm over ssh, mostly from inside zellij. They are
+Small terminal tools for working on the LSF farm over ssh. They are
 plain bash and Python 3 scripts (standard library only), they call no web services, and they only
 read: none kills, moves or deletes anything. The one exception is `bq`, which submits the job you
 give it.
@@ -8,7 +8,7 @@ give it.
 The most useful one is probably **the jobs picker, `bjpick`**: a pop-up list of your jobs where the
 highlighted job shows a live card (time against its limit, memory and CPU against what it asked for,
 why it is pending or how it failed) and the tails of its stdout and stderr, updated every two
-seconds. Run it in any shell, or bind it to `Alt b` in zellij.
+seconds. Just type `bjpick` in any terminal.
 
 ## Quick start (on the farm)
 
@@ -19,7 +19,7 @@ cd ~/hpc-tools
 ```
 
 That links the tools into `~/.local/bin` and downloads anything they need that you don't already
-have (fzf, fd, zellij, mdcat, viu and chafa, as prebuilt Linux binaries, into the same directory; no
+have (fzf, fd, mdcat, viu and chafa, as prebuilt Linux binaries, into the same directory; no
 root or compiling). Without `--deps` it only links the tools and lists what is missing. If it says
 `~/.local/bin` is not on your `PATH`, add the line it prints to `~/.bashrc` and open a new shell.
 Then try:
@@ -73,9 +73,6 @@ species directory, `tol -k ID` the k-mer directory. *Note: unlike the other tool
 specific to Sanger's Tree of Life data layout (`/data/tol/data/<project>/<group>/<Genus_species>`)
 and is only useful there. `TOL_DATA` overrides the root if it moves.*
 
-**`zbig`** is a helper for zellij keybindings: it grows its own floating pane to nearly full screen
-and then runs the command it was given, since zellij's `Run` action cannot size floating panes.
-
 ## What each tool needs
 
 The installer checks all of this. LSF, Python 3, curl, `pdftoppm` and ImageMagick are already on the
@@ -89,7 +86,6 @@ farm's head nodes.
 | `figs` | `fzf`, `fd`, and `chafa` and/or `viu`; `pdftoppm` for PDFs, `inkscape` or ImageMagick for SVGs |
 | `md` | `mdcat` (or Python `rich` with `md -r`) |
 | `tol` | Python 3; access to the Sanger ToL data tree |
-| `zbig` | zellij 0.42+ |
 
 ## Other LSF sites
 
@@ -103,20 +99,29 @@ export BJSTAT_QUEUES="short medium long"      # general queues bjstat compares w
 ```
 
 Other overrides: `FIGS_MODE=kitty|sixel|symbols` forces a figure renderer, `FIGS_CHAFA` points at a
-chafa binary that isn't on `PATH`, `MDCAT` likewise for mdcat, and `ZBIG_GEOM="x y width height"`
-sets the size `zbig` grows a pane to.
+chafa binary that isn't on `PATH`, `MDCAT` likewise for mdcat, and (with zellij)
+`ZBIG_GEOM="x y width height"` sets the size `zbig` grows a pane to.
 
 If you use Claude Code, `bjstat` also tells you which Claude session submitted each set of jobs, by
 reading the session files under `~/.claude`. Without them that column is simply left out.
 
-## Zellij keys
+## Optional: zellij
 
-`zellij/keybindings.kdl` adds two pop-up (floating) panes: `Alt b` for the jobs picker and `Alt e` for
-the figure browser. Neither clashes with zellij's own keys, and they work in every mode. To add them:
+Nothing above needs zellij. If you do use it (a terminal multiplexer, like tmux), the jobs picker
+and figure browser can pop up over whatever you're doing with one key: `Alt b` for jobs, `Alt e`
+for figures. Set it up with:
+
+```bash
+./install.sh --zellij            # add --deps to also download zellij 0.42 if you don't have it
+```
+
+This also installs `zbig`, a small helper that grows the pop-up pane to nearly full screen (zellij
+can't size pop-ups from a keybinding itself). Then add the keys:
 
 1. If you have no `~/.config/zellij/config.kdl` yet, create one with
    `mkdir -p ~/.config/zellij && zellij setup --dump-config > ~/.config/zellij/config.kdl`.
 2. Paste the `shared { ... }` block from `zellij/keybindings.kdl` inside the `keybinds { ... }` section.
+   Neither key clashes with zellij's own, and they work in every mode.
 3. Check it with `zellij setup --check` (it should say "Well defined"), then start a new session or
    detach and reattach.
 

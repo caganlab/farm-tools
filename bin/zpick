@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# zpick — switch between zellij sessions from inside zellij (or attach from outside).
+#
+#   zpick            fzf list of your sessions (exited ones too); enter switches to it
+#                    ctrl-n makes a new session named as typed, starting in this directory
+#   -h               this help
+#
+# zellij 0.42 has no command-line "switch session", but plugins may, so inside zellij zpick hands
+# the name to the small zswitch plugin (zellij/zswitch.wasm, source in zswitch/) with `zellij pipe`.
+# The first time, zellij asks whether zswitch may switch sessions: press y in that pop-up.
+# Env: ZSWITCH = plugin path (default ~/.config/zellij/plugins/zswitch.wasm),
+#      ZPICK_LAYOUT = layout name for ctrl-n sessions (default: zellij's default layout).
+set -uo pipefail
+[[ ${1:-} == -h || ${1:-} == --help ]] && { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+command -v fzf >/dev/null || { echo "zpick: needs fzf" >&2; exit 1; }
+ZSWITCH=${ZSWITCH:-$HOME/.config/zellij/plugins/zswitch.wasm}
+cur=${ZELLIJ_SESSION_NAME:-}
+
+hdr="enter switch · ctrl-n new session named as typed · esc close"
+[[ -n $cur ]] || hdr="enter attach · ctrl-n new session named as typed · esc close"
+out=$(zellij list-sessions -n 2>/dev/null | grep -v ' (current)$' |
+      sed -E 's/ \[Created [^]]*\]//; s/\(EXITED - attach to resurrect\)/(exited)/' |
+      fzf --no-sort --reverse --header="$hdr" --print-query --expect=ctrl-n) || [[ -n ${out:-} ]] || exit 0
+query=$(sed -n 1p <<< "$out"); key=$(sed -n 2p <<< "$out"); s=$(sed -n 3p <<< "$out" | awk '{print $1}')
+new=0
+if [[ $key == ctrl-n ]]; then
+  [[ -n $query ]] || { echo "zpick: type a name first" >&2; sleep 1; exit 1; }
+  s=${query// /-}; new=1
+fi
+[[ -n $s ]] || exit 0
+
+if [[ -z $cur ]]; then                       # not inside zellij: just attach / create
+  if (( new )); then exec zellij -s "$s" ${ZPICK_LAYOUT:+-n "$ZPICK_LAYOUT"}; fi
+  exec zellij attach "$s"
+fi
+[[ $s == "$cur" ]] && exit 0
+[[ -f $ZSWITCH ]] || { echo "zpick: no plugin at $ZSWITCH (run ./install.sh --zellij)" >&2; sleep 2; exit 1; }
+# A plugin started by `zellij pipe` runs hidden and can't show zellij's permission prompt, so the
+# first time open it visibly; the switch is queued and happens once you press y.
+if ! grep -qF "\"$ZSWITCH\"" "${XDG_CACHE_HOME:-$HOME/.cache}/zellij/permissions.kdl" 2>/dev/null; then
+  zellij action launch-plugin --floating "file:$ZSWITCH"
+  echo "First use: zellij is asking whether zswitch may switch sessions (the pop-up). Press y there."
+fi
+args=()
+(( new )) && args=(--args "cwd=$PWD${ZPICK_LAYOUT:+,layout=$ZPICK_LAYOUT}")
+zellij pipe --plugin "file:$ZSWITCH" "${args[@]}" -- "$s"

@@ -4,8 +4,9 @@
 #   ./install.sh           link bin/* into $PREFIX (default ~/.local/bin) and report missing dependencies
 #   ./install.sh --deps    also download the missing ones (fzf, fd, mdcat, viu, chafa) as
 #                          prebuilt Linux x86_64 binaries into $PREFIX. No root, no compiler needed.
-#   --zellij               optional extra: also set up for zellij (links zbig; with --deps also
-#                          downloads zellij if you don't have it). Flags combine: --deps --zellij
+#   --zellij               optional extra: also set up for zellij (links zbig and zpick, puts the
+#                          zswitch plugin in ~/.config/zellij/plugins; with --deps also downloads
+#                          zellij if you don't have it). Flags combine: --deps --zellij
 #
 # Links, not copies, so `git pull` in this directory updates the tools. Existing files in $PREFIX
 # with the same name are never overwritten (you're told instead). Undo: ./install.sh --uninstall
@@ -13,11 +14,12 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PREFIX=${PREFIX:-$HOME/.local/bin}
+PLUGDIR=${XDG_CONFIG_HOME:-$HOME/.config}/zellij/plugins
 deps=0; zj=0; uninstall=0
 for a in "$@"; do
   case $a in
     --deps) deps=1 ;; --zellij) zj=1 ;; --uninstall) uninstall=1 ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install.sh: unknown option $a (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -27,6 +29,8 @@ if (( uninstall )); then
     t="$PREFIX/$(basename "$f")"
     [[ -L $t && $(readlink "$t") == "$f" ]] && rm "$t" && echo "removed $t"
   done
+  t=$PLUGDIR/zswitch.wasm
+  [[ -L $t && $(readlink "$t") == "$REPO/zellij/zswitch.wasm" ]] && rm "$t" && echo "removed $t"
   exit 0
 fi
 
@@ -34,11 +38,17 @@ mkdir -p "$PREFIX"
 echo "Linking tools into $PREFIX"
 for f in "$REPO"/bin/*; do
   name=$(basename "$f"); t="$PREFIX/$name"
-  [[ $name == zbig ]] && (( ! zj )) && continue      # zellij-only helper
+  [[ $name == zbig || $name == zpick ]] && (( ! zj )) && continue      # zellij-only helpers
   if [[ -L $t && $(readlink "$t") == "$f" ]]; then echo "  $name  already linked"
   elif [[ -e $t || -L $t ]]; then echo "  $name  SKIPPED: $t already exists (not ours)"
   else ln -s "$f" "$t"; echo "  $name"; fi
 done
+if (( zj )); then                                  # session-switch plugin used by zpick
+  mkdir -p "$PLUGDIR"; f=$REPO/zellij/zswitch.wasm; t=$PLUGDIR/zswitch.wasm
+  if [[ -L $t && $(readlink "$t") == "$f" ]]; then echo "  zswitch.wasm  already linked"
+  elif [[ -e $t || -L $t ]]; then echo "  zswitch.wasm  SKIPPED: $t already exists (not ours)"
+  else ln -s "$f" "$t"; echo "  zswitch.wasm  -> $PLUGDIR"; fi
+fi
 
 case ":$PATH:" in *":$PREFIX:"*) ;; *)
   echo
@@ -55,7 +65,7 @@ DEPS=(
   "viu|viu --version|figs (images in Ghostty/kitty/iTerm)|https://github.com/atanunq/viu/releases/download/v1.5.1/viu-x86_64-unknown-linux-musl|-"
   "chafa|chafa --version|figs (images in terminals without image support, e.g. Alacritty, and inside zellij)|https://hpjansson.org/chafa/releases/static/chafa-1.18.3-1-x86_64-linux-gnu.tar.gz|chafa-1.18.3-1-x86_64-linux-gnu/chafa"
 )
-(( zj )) && DEPS+=("zellij|zellij --version|zbig and the zellij keybindings|https://github.com/zellij-org/zellij/releases/download/v0.42.2/zellij-x86_64-unknown-linux-musl.tar.gz|zellij")
+(( zj )) && DEPS+=("zellij|zellij --version|zbig, zpick and the zellij keybindings|https://github.com/zellij-org/zellij/releases/download/v0.42.2/zellij-x86_64-unknown-linux-musl.tar.gz|zellij")
 
 fetch() {   # URL INNER-PATH NAME
   local url=$1 inner=$2 name=$3 tmp
@@ -90,5 +100,5 @@ if (( missing && ! deps )); then
   echo "Run ./install.sh --deps to download the missing ones into $PREFIX."
 fi
 if (( zj )); then echo "Zellij keys: paste the block from $REPO/zellij/keybindings.kdl (see README)."
-else echo "Using zellij? ./install.sh --zellij adds the pop-up job picker key (optional)."; fi
+else echo "Using zellij? ./install.sh --zellij adds the pop-up job picker and session switcher keys (optional)."; fi
 echo "Every tool has -h."

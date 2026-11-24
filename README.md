@@ -230,19 +230,28 @@ reading the session files under `~/.claude`. Without them that column is simply 
 
 Nothing above needs zellij. If you do use it (a terminal multiplexer, like tmux), the jobs picker
 and figure browser can pop up over whatever you're doing with one key: `Alt b` for jobs, `Alt e`
-for figures. Set it up with:
+for figures, and `Alt s` switches to another of your zellij sessions. Set it up with:
 
 ```bash
 ./install.sh --zellij            # add --deps to also download zellij 0.42 if you don't have it
 ```
 
 This also installs `zbig`, a small helper that grows the pop-up pane to nearly full screen (zellij
-can't size pop-ups from a keybinding itself). Then add the keys:
+can't size pop-ups from a keybinding itself), and `zpick`, the session switcher. zellij 0.42 has no
+command to switch sessions from a script, but its plugins can, so `zpick` lists your sessions
+(exited ones too) in fzf and hands your choice to `zswitch`, a 70-line plugin whose Rust source is
+in `zswitch/` and whose compiled form (`zellij/zswitch.wasm`) is linked into
+`~/.config/zellij/plugins`. Enter switches, and `ctrl-n` starts a new session named as you typed,
+in the current directory. The first time, zellij pops up a question asking whether zswitch may
+change sessions: press `y`, and it remembers. Outside zellij, `zpick` simply attaches.
+To rebuild the plugin yourself: `rustup target add wasm32-wasip1 && cd zswitch && cargo build --release`.
+
+Then add the keys:
 
 1. If you have no `~/.config/zellij/config.kdl` yet, create one with
    `mkdir -p ~/.config/zellij && zellij setup --dump-config > ~/.config/zellij/config.kdl`.
 2. Paste the `shared { ... }` block from `zellij/keybindings.kdl` inside the `keybinds { ... }` section.
-   Neither key clashes with zellij's own, and they work in every mode.
+   None of the keys clashes with zellij's own, and they work in every mode.
 3. Check it with `zellij setup --check` (it should say "Well defined"), then start a new session or
    detach and reattach.
 

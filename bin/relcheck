@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""relcheck — what it takes to release this repo to crates.io, GitHub releases and bioconda.
+
+  relcheck [DIR]            check the git repo at DIR (default: here) and print exact steps
+  relcheck -V 0.4.0 [DIR]   plan for this new version instead of the one in Cargo.toml/pyproject
+  relcheck -w OUT [DIR]     also write a draft bioconda recipe (meta.yaml, build.sh) into OUT
+  relcheck --offline        only look at the repo; skip crates.io / GitHub / bioconda lookups
+  relcheck --only crates,github,bioconda   limit the checks
+  relcheck -n NAME          the name to use on bioconda (when the package name is taken there)
+
+Env: BIOCONDA_RECIPES = your clone of your bioconda-recipes fork (the steps then use it).
+
+Only reads. It never tags, pushes, publishes or opens PRs; it prints the commands for you.
+Rust crates get all three targets; Python packages get GitHub (source release) and bioconda.
+Lookups use public APIs (crates.io, api.github.com, api.anaconda.org); set GH_TOKEN for a
+higher GitHub rate limit. The release tarball is downloaded to compute its sha256 when the tag
+is already on GitHub.
+"""
+import argparse, hashlib, json, os, re, subprocess, sys, urllib.error, urllib.request
+
+try:
+    import tomllib  # 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
+
+TTY = sys.stdout.isatty()
+def c(code, s): return f"\x1b[{code}m{s}\x1b[0m" if TTY else s
+OK, BAD, WARN, INFO = c("32", "✓"), c("31", "✗"), c("33", "!"), c("2", "·")
+bold = lambda s: c("1", s)
+dim = lambda s: c("2", s)
+
+
+# ---------- small helpers ----------
+def sh(*cmd, cwd=None, check=False):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if check and r.returncode:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+OFFLINE = False
+def get(url, raw=False, accept=None):
+    """GET url -> parsed JSON (or bytes with raw=True); None on 404/no network; raises nothing."""
+    if OFFLINE:
+        return None
+    h = {"User-Agent": "relcheck"}
+    if accept:
+        h["Accept"] = accept
+    tok = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if tok and "api.github.com" in url:
+        h["Authorization"] = f"Bearer {tok}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20) as r:
+            data = r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 403 and "github" in url:
+            NOTES.add("GitHub API rate limit hit; set GH_TOKEN for more lookups")
+        return None
+    except Exception:
+        NOTES.add("network lookups failed (offline?); results are repo-only")
+        return None
+    if raw:
+        return data
+    try:
+        return json.loads(data)
+    except ValueError:
+        return data.decode(errors="replace")
+
+
+NOTES = set()
+
+
+def vtuple(v):
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-+]", str(v).lstrip("v"))[:3])
+
+
+class Report:
+    def __init__(self):
+        self.blockers = []
+
+    def section(self, title):
+        print("\n" + bold(title))
+
+    def ok(self, s): print(f"  {OK} {s}")
+    def info(self, s): print(f"  {INFO} {s}")
+    def warn(self, s): print(f"  {WARN} {s}")
+
+    def bad(self, s, target):
+        print(f"  {BAD} {s}")
+        self.blockers.append((target, s))
+
+
+# ---------- reading the repo ----------
+def read_toml(path):
+    txt = open(path).read()
+    if tomllib:
+        return tomllib.loads(txt)
+    # minimal fallback (python 3.10 without tomli): top-level sections, simple keys, string arrays
+    out, cur = {}, None
+    for line in txt.splitlines():
+        line = line.split(" #")[0].strip()
+        m = re.match(r"^\[([^\[\]]+)\]$", line)
+        if m:
+            cur = out
+            for k in m.group(1).split("."):
+                cur = cur.setdefault(k.strip().strip('"'), {})
+            continue
+        m = re.match(r'^([\w\-"]+)\s*=\s*(.+)$', line)
+        if m and cur is not None:
+            k, v = m.group(1).strip('"'), m.group(2).strip()
+            if v.startswith('"'):
+                cur[k] = v.strip('"')
+            elif v.startswith("["):
+                cur[k] = re.findall(r'"([^"]*)"', v)
+            elif v in ("true", "false"):
+                cur[k] = v == "true"
+            else:
+                cur[k] = v
+    return out
+
+
+def github_slug(url):
+    m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?/?$", url or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def repo_info(root):
+    r = {"root": root}
+    r["branch"] = sh("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=root)
+    r["dirty"] = [l for l in (sh("git", "status", "--porcelain", "--untracked-files=no", cwd=root) or "").splitlines() if l]
+    r["remote"] = sh("git", "remote", "get-url", "origin", cwd=root)
+    r["slug"] = github_slug(r["remote"])
+    r["upstream"] = sh("git", "rev-parse", "--abbrev-ref", "@{u}", cwd=root)
+    r["ahead"] = int(sh("git", "rev-list", "--count", "@{u}..HEAD", cwd=root) or 0) if r["upstream"] else None
+    r["tags"] = (sh("git", "tag", "--sort=-v:refname", cwd=root) or "").split()
+    vt = [t for t in r["tags"] if re.match(r"^v?\d+\.\d+", t)]
+    r["vprefix"] = bool(vt) and sum(t.startswith("v") for t in vt) * 2 >= len(vt)
+    return r
+
+
+def rust_info(root):
+    out = sh("cargo", "metadata", "--no-deps", "--format-version", "1", cwd=root)
+    if not out:
+        return None
+    md = json.loads(out)
+    members = set(md.get("workspace_members", []))
+    pkgs = [p for p in md["packages"] if p["id"] in members]
+    lock = open(os.path.join(root, "Cargo.lock")).read() if os.path.exists(os.path.join(root, "Cargo.lock")) else ""
+    locked = set(re.findall(r'^name = "([^"]+)"', lock, re.M))
+    bins = sorted({t["name"] for p in pkgs for t in p["targets"] if "bin" in t["kind"]})
+    return {"packages": pkgs, "locked": locked, "has_lock": bool(lock), "bins": bins,
+            "ws_root": md.get("workspace_root", root)}
+
+
+def python_info(root):
+    pp = os.path.join(root, "pyproject.toml")
+    if not os.path.exists(pp):
+        return None
+    t = read_toml(pp)
+    proj = t.get("project", {})
+    lic = proj.get("license")
+    if isinstance(lic, dict):
+        lic = lic.get("text") or lic.get("file")
+    return {"name": proj.get("name"), "version": proj.get("version"), "license": lic,
+            "description": proj.get("description"), "deps": proj.get("dependencies", []),
+            "requires_python": proj.get("requires-python"),
+            "scripts": proj.get("scripts", {}), "build": t.get("build-system", {}).get("requires", []),
+            "urls": proj.get("urls", {}), "dynamic": proj.get("dynamic", [])}
+
+
+# ---------- checks ----------
+def topo(pkgs):
+    """Order workspace packages so path dependencies are published first."""
+    names = {p["name"]: p for p in pkgs}
+    done, order = set(), []
+    def visit(n, stack=()):
+        if n in done or n in stack:
+            return
+        for d in names[n]["dependencies"]:
+            if d["name"] in names and d.get("path") and d.get("kind") != "dev":
+                visit(d["name"], stack + (n,))
+        done.add(n); order.append(names[n])
+    for n in names:
+        visit(n)
+    return order
+
+
+def check_crates(rep, ri, rust, version):
+    rep.section("crates.io")
+    publishable = []
+    for p in topo(rust["packages"]):
+        name = p["name"]
+        if p.get("publish") == []:
+            rep.info(f"{name}: publish = false in Cargo.toml, skipped")
+            continue
+        problems = []
+        for d in p["dependencies"]:
+            if d.get("kind") == "dev":
+                continue  # dev-deps without a version are stripped on publish
+            if d.get("source", "") and d["source"].startswith("git+"):
+                problems.append(f"git dependency {d['name']} (crates.io only accepts registry deps)")
+            elif d.get("path") and d.get("req") in (None, "*"):
+                problems.append(f"path dependency {d['name']} has no version = \"…\"")
+        for p_ in problems:
+            rep.bad(f"{name}: {p_}", "crates")
+        if not (p.get("license") or p.get("license_file")):
+            rep.bad(f"{name}: no license (or license-file) in [package]", "crates")
+        if not p.get("description"):
+            rep.bad(f"{name}: no description in [package]", "crates")
+        for k in ("repository", "readme"):
+            if not p.get(k):
+                rep.warn(f"{name}: no {k} in [package] (recommended)")
+        if not p.get("keywords") or not p.get("categories"):
+            rep.info(f"{name}: keywords/categories help people find it on crates.io")
+
+        cr = get(f"https://crates.io/api/v1/crates/{name}")
+        pv = p["version"] if len(rust["packages"]) > 1 else version
+        if OFFLINE or cr is None and NOTES:
+            rep.info(f"{name}: crates.io not checked")
+        elif cr is None:
+            rep.ok(f"{name}: name is free on crates.io (first publish)")
+        else:
+            vers = [v["num"] for v in cr.get("versions", []) if not v.get("yanked")]
+            top = cr["crate"].get("max_stable_version") or cr["crate"]["max_version"]
+            owners = get(f"https://crates.io/api/v1/crates/{name}/owners") or {}
+            who = ", ".join(u.get("login", "?") for u in owners.get("users", []))
+            if pv in vers:
+                rep.ok(f"{name} {pv} is already on crates.io (owners: {who})")
+                continue
+            if vtuple(pv) <= vtuple(top):
+                rep.bad(f"{name}: version {pv} is not above the published {top}; bump it", "crates")
+                if vtuple(pv) < vtuple(top):
+                    rep.info("crates.io is ahead of this clone: is it out of date? (git pull)")
+            else:
+                rep.ok(f"{name}: crates.io has {top}; {pv} would be new (owners: {who})")
+        if not problems:
+            publishable.append(p)
+    if not rust["has_lock"]:
+        rep.warn("no Cargo.lock committed; bioconda builds with --locked, so commit one")
+    return publishable
+
+
+def check_github(rep, ri, rust, tag, version):
+    rep.section("GitHub release")
+    root = ri["root"]
+    if not ri["slug"]:
+        rep.bad(f"origin is not a GitHub remote ({ri['remote'] or 'none'})", "github")
+        return {}
+    o, n = ri["slug"]
+    st = {"slug": f"{o}/{n}"}
+    wfdir = os.path.join(root, ".github", "workflows")
+    wfs = {f: open(os.path.join(wfdir, f)).read() for f in sorted(os.listdir(wfdir))} if os.path.isdir(wfdir) else {}
+    dist_wf = [f for f, t in wfs.items() if "cargo-dist" in t or "axodotdev" in t]
+    other_wf = [f for f, t in wfs.items() if f not in dist_wf and re.search(r"release|upload-release|rust-build", t)
+                and re.search(r"(tags|release):", t)]
+    st["dist"] = bool(dist_wf)
+    if rust:
+        cfg = ""
+        for f in ("dist-workspace.toml", "Cargo.toml"):
+            pth = os.path.join(rust["ws_root"], f)
+            if os.path.exists(pth):
+                cfg += open(pth).read()
+        if dist_wf:
+            want = re.search(r'cargo-dist-version\s*=\s*"([^"]+)"', cfg)
+            have = sh("dist", "--version") or sh("cargo", "dist", "--version")
+            have = have.split()[-1] if have else None
+            msg = f"cargo-dist release workflow: .github/workflows/{dist_wf[0]}"
+            if want:
+                msg += f" (pinned {want.group(1)}"
+                msg += f", you have {have})" if have else ")"
+            rep.ok(msg)
+            targets = re.search(r"targets\s*=\s*\[([^\]]*)\]", cfg)
+            if targets:
+                ts = re.findall(r'"([^"]+)"', targets.group(1))
+                rep.info("builds: " + ", ".join(ts))
+            if want and have and want.group(1) != have:
+                rep.info(f"cargo-dist versions differ; `dist init --yes` regenerates the workflow for {have}")
+        elif other_wf:
+            t = wfs[other_wf[0]]
+            trig = "creating a GitHub release" if re.search(r"release:\s*\n\s*types:", t) else "pushing a tag"
+            st["other"] = (other_wf[0], trig)
+            rep.ok(f"release workflow (not cargo-dist): .github/workflows/{other_wf[0]}, triggered by {trig}")
+        else:
+            rep.bad("no release workflow builds binaries; set up cargo-dist (steps below)", "github")
+            st["need_dist"] = True
+    else:
+        rep.info("Python package: the release is the tagged source; no binaries to build")
+
+    # tag + release state on GitHub
+    remote_tag = get(f"https://api.github.com/repos/{o}/{n}/git/ref/tags/{tag}")
+    st["tag_on_github"] = isinstance(remote_tag, dict) and "object" in remote_tag
+    local_tag = tag in ri["tags"]
+    rel = get(f"https://api.github.com/repos/{o}/{n}/releases/tags/{tag}")
+    if local_tag and st["tag_on_github"]:
+        rep.ok(f"tag {tag} exists here and on GitHub")
+    elif local_tag:
+        rep.warn(f"tag {tag} exists locally but not on GitHub" + ("" if not OFFLINE else " (not checked)"))
+    elif st["tag_on_github"]:
+        rep.warn(f"tag {tag} is on GitHub but not in this clone (git fetch --tags)")
+    else:
+        rep.info(f"tag {tag} not made yet")
+    if isinstance(rel, dict) and rel.get("tag_name"):
+        na = len(rel.get("assets", []))
+        if rust and na == 0:
+            rep.bad(f"release {tag} exists but has no binaries attached", "github")
+            if dist_wf:
+                rep.info("cargo-dist's host job sometimes fails with 'No artifacts found': re-run that job in Actions")
+        else:
+            rep.ok(f"release {tag} is published with {na} files: {rel.get('html_url')}")
+        st["released"] = True
+    latest = get(f"https://api.github.com/repos/{o}/{n}/releases/latest")
+    if isinstance(latest, dict) and latest.get("tag_name") and latest["tag_name"] != tag:
+        rep.info(f"latest GitHub release: {latest['tag_name']}")
+        if vtuple(latest["tag_name"]) > vtuple(version):
+            rep.bad(f"GitHub already has a newer release ({latest['tag_name']}) than {version}", "github")
+    # changelog
+    for f in ("CHANGELOG.md", "CHANGES.md", "NEWS.md"):
+        pth = os.path.join(root, f)
+        if os.path.exists(pth):
+            if re.search(rf"\b{re.escape(version)}\b", open(pth).read()):
+                rep.ok(f"{f} mentions {version}")
+                st["changelog_ok"] = True
+            else:
+                rep.warn(f"{f} has no entry for {version}")
+            break
+    return st
+
+
+RUST_SYS = {  # crate in Cargo.lock -> (bioconda host dep, build dep)
+    "openssl-sys": ("openssl", None), "libz-sys": ("zlib", None), "bzip2-sys": ("bzip2", None),
+    "lzma-sys": ("xz", None), "zstd-sys": ("zstd", None), "cmake": (None, "cmake"),
+    "bindgen": ("clangdev", None), "hdf5-sys": ("hdf5", None), "curl-sys": ("libcurl", None),
+}
+
+
+def check_bioconda(rep, ri, rust, py, name, version, tag, gh):
+    rep.section("bioconda")
+    st = {"name": name}
+    meta = get(f"https://raw.githubusercontent.com/bioconda/bioconda-recipes/master/recipes/{name}/meta.yaml")
+    ana = get(f"https://api.anaconda.org/package/bioconda/{name}")
+    if isinstance(meta, str):
+        m = re.search(r'set version = "([^"]+)"', meta) or re.search(r"version:\s*\"?([\w.]+)", meta)
+        rv = m.group(1) if m else "?"
+        st["recipe"] = rv
+        built = ana.get("latest_version") if isinstance(ana, dict) else None
+        src = re.search(r"url:\s*(.+)", meta)
+        src = src.group(1).strip() if src else ""
+        slug = gh.get("slug") or ""
+        if slug and slug.lower() not in meta.lower():
+            rep.bad(f"bioconda's '{name}' is a different tool ({src or 'unknown source'}); "
+                    f"this package needs another name there: try relcheck -n OTHERNAME", "bioconda")
+            own = os.path.join(ri["root"], "recipe", "meta.yaml")
+            if os.path.exists(own) and re.search(rf'set name = "{re.escape(name)}"|name: {re.escape(name)}\b', open(own).read()):
+                rep.warn(f"recipe/meta.yaml in this repo also uses the name '{name}'")
+            st["clash"] = True
+            return st
+        rep.ok(f"recipe recipes/{name} exists (version {rv}; built package {built or '?'})")
+        if src:
+            rep.info(f"source: {src}")
+        if vtuple(rv) >= vtuple(version):
+            rep.ok(f"bioconda is already at {rv}")
+            st["current"] = True
+        else:
+            st["bump"] = True
+            rep.info(f"needs {rv} -> {version}. The bioconda bot usually opens this bump PR itself "
+                     "within a day of the GitHub release, so check before doing it by hand")
+    elif OFFLINE:
+        rep.info("bioconda not checked")
+        st["unknown"] = True
+    else:
+        st["new"] = True
+        if isinstance(ana, dict):
+            rep.warn(f"no recipes/{name} on bioconda master, but anaconda has bioconda/{name} — renamed or removed?")
+        else:
+            rep.info(f"no recipe for {name} on bioconda yet: a new-recipe PR is needed")
+    prs = get("https://api.github.com/search/issues?q=" + urllib.request.quote(
+        f"repo:bioconda/bioconda-recipes is:pr is:open {name} in:title"))
+    if isinstance(prs, dict):
+        hits = [i for i in prs.get("items", []) if re.search(rf"\b{re.escape(name)}\b", i["title"], re.I)]
+        live = []
+        for i in hits[:5]:
+            pv = re.search(r"\d+\.\d+(?:\.\d+)?", i["title"])
+            if st.get("recipe") and pv and vtuple(pv.group(0)) <= vtuple(st["recipe"]):
+                rep.info(f"stale open PR #{i['number']} ({i['title']}): bioconda is already at {st['recipe']}, it can be closed")
+            else:
+                rep.warn(f"open PR #{i['number']}: {i['title']} ({i['user']['login']}) {i['html_url']}")
+                live.append(i)
+        hits = live
+        st["open_prs"] = hits
+    own = os.path.join(ri["root"], "recipe", "meta.yaml")
+    if os.path.exists(own):
+        txt = open(own).read()
+        m = re.search(r'set version = "([^"]+)"', txt)
+        rep.info(f"this repo has its own draft: recipe/meta.yaml (version {m.group(1) if m else '?'})")
+        if m and m.group(1) != version:
+            rep.warn(f"recipe/meta.yaml says {m.group(1)}, the package says {version}")
+        st["own"] = own
+    lic = [f for f in os.listdir(ri["root"]) if re.match(r"(LICEN[CS]E|COPYING)", f, re.I)]
+    if lic:
+        rep.ok(f"licence file: {lic[0]}")
+    else:
+        rep.bad("no LICENSE file in the repo root (bioconda needs one)", "bioconda")
+    st["license_file"] = lic[0] if lic else "LICENSE"
+    if rust:
+        host = sorted({h for k, (h, b) in RUST_SYS.items() if k in rust["locked"] and h})
+        build = sorted({b for k, (h, b) in RUST_SYS.items() if k in rust["locked"] and b})
+        if host or build:
+            rep.info("native libraries in Cargo.lock -> recipe needs " +
+                     ", ".join([f"host: {h}" for h in host] + [f"build: {b}" for b in build]))
+        st["host"], st["build"] = host, build
+    # tarball sha256, only once the tag exists on GitHub
+    if gh.get("slug"):
+        url = f"https://github.com/{gh['slug']}/archive/refs/tags/{tag}.tar.gz"
+        st["url"] = url
+        if gh.get("tag_on_github"):
+            data = get(url, raw=True)
+            if data:
+                st["sha"] = hashlib.sha256(data).hexdigest()
+                rep.ok(f"sha256 of the {tag} tarball: {st['sha']}")
+    return st
+
+
+# ---------- recipe drafting ----------
+def conda_name(req):
+    m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*(.*)$", req)
+    n, spec = m.group(1).lower().replace("_", "-"), m.group(3).split(";")[0].replace(" ", "")
+    n = {"pyyaml": "pyyaml", "scikit-learn": "scikit-learn", "torch": "pytorch"}.get(n, n)
+    return f"{n} {spec}".strip()
+
+
+def draft_recipe(rust, py, name, version, tag, gh, bc, desc, lic, home):
+    url = bc.get("url", f"https://github.com/OWNER/REPO/archive/refs/tags/{tag}.tar.gz")
+    url_t = url.replace(tag, ("v" if tag.startswith("v") else "") + "{{ version }}")
+    sha = bc.get("sha", "RUN: curl -sL " + url + " | sha256sum")
+    head = f'{{% set name = "{name}" %}}\n{{% set version = "{version}" %}}\n\npackage:\n  name: {{{{ name }}}}\n' \
+           f'  version: {{{{ version }}}}\n\nsource:\n  url: {url_t}\n  sha256: {sha}\n\n'
+    about = f'about:\n  home: "{home}"\n  license: {lic}\n  license_family: {lic.split("-")[0].split()[0] if lic else "OTHER"}\n' \
+            f'  license_file:\n    - {bc.get("license_file", "LICENSE")}\n'
+    if rust:
+        about += "    - THIRDPARTY.yml\n"
+    about += f'  summary: "{(desc or "").strip()}"\n  dev_url: "{home}"\n'
+    if rust:
+        bins = rust["bins"] or [name]
+        reqs = ["{{ compiler('c') }}", "{{ compiler('rust') }}", "{{ stdlib('c') }}", "cargo-bundle-licenses"]
+        reqs += bc.get("build", [])
+        host = bc.get("host", [])
+        meta = head + "build:\n  number: 0\n  run_exports:\n    - {{ pin_subpackage(name, max_pin=\"x.x\") }}\n\n"
+        meta += "requirements:\n  build:\n" + "".join(f"    - {r}\n" for r in reqs)
+        if host:
+            meta += "  host:\n" + "".join(f"    - {h}\n" for h in host)
+        meta += "\ntest:\n  commands:\n" + "".join(f"    - {b} --version\n" for b in bins) + "\n" + about
+        meta += "\nextra:\n  additional-platforms:\n    - linux-aarch64\n    - osx-arm64\n"
+        path = "." if len(rust["packages"]) == 1 else "PATH/TO/BIN/CRATE"
+        build = "#!/bin/bash\nset -xe\n\ncargo-bundle-licenses --format yaml --output THIRDPARTY.yml\n" \
+                f'cargo install --verbose --locked --no-track --root "${{PREFIX}}" --path {path}\n'
+        return meta, build
+    rp = py.get("requires_python") or ""
+    entry = "".join(f"    - {k} = {v}\n" for k, v in py.get("scripts", {}).items())
+    meta = head + "build:\n  number: 0\n  noarch: python\n"
+    if entry:
+        meta += "  entry_points:\n" + entry
+    meta += "  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation --no-cache-dir -vvv\n"
+    meta += "  run_exports:\n    - {{ pin_subpackage(name, max_pin=\"x.x\") }}\n\n"
+    meta += f"requirements:\n  host:\n    - python {rp}\n    - pip\n" + \
+            "".join(f"    - {conda_name(b)}\n" for b in py.get("build", []))
+    meta += f"  run:\n    - python {rp}\n" + "".join(f"    - {conda_name(d)}\n" for d in py.get("deps", []))
+    meta += "    # add non-Python tools the package calls here\n"
+    meta += f"\ntest:\n  imports:\n    - {name.replace('-', '_')}\n"
+    if py.get("scripts"):
+        meta += "  commands:\n" + "".join(f"    - {k} --help\n" for k in py["scripts"])
+    meta += "\n" + about
+    return meta, None
+
+
+# ---------- the plan ----------
+def plan(ri, rust, py, version, tag, targets, crates_ok, gh, bc, wrote):
+    steps = []
+    root = ri["root"]
+    cur = (rust["packages"][0]["version"] if rust and len(rust["packages"]) == 1 else py["version"] if py else None)
+    tagged = tag in ri["tags"] or gh.get("tag_on_github")
+    if not tagged:
+        pre = []
+        if cur and cur != version:
+            f = "Cargo.toml" if rust else "pyproject.toml"
+            pre.append(f"sed -i 's/^version = \"{cur}\"/version = \"{version}\"/' {f}" +
+                       ("   # and Cargo.lock: cargo update -p " + rust["packages"][0]["name"] if rust else ""))
+        if not gh.get("changelog_ok"):
+            pre.append(f"# add a {version} entry to CHANGELOG.md")
+        if rust:
+            pre.append("cargo build --release && cargo test   # on a compute node: bq -m 8G -n 4 -t 1h -- cargo test")
+        if ri["dirty"] or (cur and cur != version):
+            pre.append(f'git commit -am "Release {version}"')
+        steps.append(("Prepare the version", pre))
+    if "github" in targets and not (gh.get("released") and gh.get("tag_on_github")):
+        g = []
+        if gh.get("need_dist") and rust:
+            g += ["dist init        # pick linux x86_64/aarch64 + macOS targets, GitHub CI; writes release.yml",
+                  "dist plan        # dry run: lists the archives it will build",
+                  'git add -A && git commit -m "Set up cargo-dist releases"']
+        if tag not in ri["tags"]:
+            g.append(f"git tag {tag}")
+        if not gh.get("tag_on_github"):
+            g.append(f"git push origin {ri['branch'] or 'main'} {tag}")
+        if gh.get("tag_on_github") and (gh.get("dist") or gh.get("other")):
+            g.append(f"# tag {tag} is pushed but has no release: check the workflow run, or re-run it")
+        if gh.get("dist") or gh.get("need_dist"):
+            g.append(f"# the tag push starts the Release workflow; watch it: gh run watch -R {gh.get('slug')}")
+            g.append("# if its host job says 'No artifacts found', re-run that job")
+        elif gh.get("other") and gh["other"][1].startswith("creating"):
+            g.append(f"gh release create {tag} -R {gh['slug']} --generate-notes   # this triggers {gh['other'][0]}")
+        else:
+            g.append(f"gh release create {tag} -R {gh.get('slug')} --generate-notes" +
+                     ("" if rust else "   # source-only release"))
+        steps.append(("GitHub release", g))
+    if "crates" in targets and rust and crates_ok:
+        url = ri["remote"]
+        cmds = ["# once: cargo login   (token from https://crates.io/settings/tokens)",
+                f"d=$(mktemp -d) && git clone --depth 1 --branch {tag} {url} $d && cd $d",
+                "# (a clean clone: the sandbox and builds leave stray files that would get packaged)"]
+        for p in crates_ok:
+            m = f" -p {p['name']}" if len(rust["packages"]) > 1 else ""
+            cmds += [f"cargo publish --dry-run{m}", f"cargo publish{m}"]
+        cmds.append("cd - && rm -rf $d")
+        steps.append(("crates.io", cmds))
+    if "bioconda" in targets and not bc.get("current") and not bc.get("clash"):
+        name = bc["name"]
+        b = []
+        if bc.get("open_prs"):
+            b.append("# an open PR for this already exists (above): update or review that instead")
+        if bc.get("bump"):
+            b += ["# wait a day after the GitHub release: the bioconda bot normally opens the bump PR;",
+                  f"# check https://github.com/bioconda/bioconda-recipes/pulls?q={name}",
+                  "# only if it hasn't, bump by hand:"]
+        br = os.environ.get("BIOCONDA_RECIPES")
+        if br:
+            b += [f"cd {br} && git fetch upstream && git checkout -b {name}-{version} upstream/master"]
+        else:
+            b += ["gh repo fork bioconda/bioconda-recipes --clone   # once (then set BIOCONDA_RECIPES to it)",
+                  f"cd bioconda-recipes && git fetch upstream && git checkout -b {name}-{version} upstream/master"]
+        if bc.get("bump"):
+            b.append(f"# in recipes/{name}/meta.yaml: version -> {version}, sha256 -> {bc.get('sha', '(after tagging) curl -sL ' + bc.get('url', 'URL') + ' | sha256sum')}, build number -> 0")
+        elif bc.get("own"):
+            own_txt = open(bc["own"]).read()
+            todo = []
+            if bc.get("sha") and bc["sha"] not in own_txt:
+                todo.append(f"sha256 -> {bc['sha']}")
+            elif not bc.get("sha"):
+                todo.append(f"sha256 for {tag} once it is pushed")
+            if not re.search(rf'set name = "{re.escape(name)}"', own_txt):
+                todo.append(f'{{% set name = "{name}" %}}')
+            b.append(f"mkdir -p recipes/{name} && cp {bc['own']} recipes/{name}/" +
+                     (f"   # then set {', '.join(todo)}" if todo else ""))
+        else:
+            b.append(f"mkdir -p recipes/{name} && cp {wrote or 'DRAFT'}/* recipes/{name}/" +
+                     ("" if wrote else "   # make the draft with: relcheck -w DRAFT"))
+        if bc.get("new") and "sha" not in bc:
+            b.append(f"curl -sL {bc.get('url', 'URL')} | sha256sum   # after the tag is pushed")
+        b += [f'git add recipes/{name} && git commit -m "{"Update" if bc.get("bump") else "Add"} {name} {version}"',
+              f"git push -u origin {name}-{version}",
+              f'gh pr create -R bioconda/bioconda-recipes --title "{"Update" if bc.get("bump") else "Add"} {name} {version}" --fill',
+              "# CI lints and builds it; a bioconda member reviews and merges (new recipes: comment @BiocondaBot please add label)"]
+        steps.append(("bioconda", b))
+    return steps
+
+
+def main():
+    global OFFLINE
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("dir", nargs="?", default=".")
+    ap.add_argument("-V", "--version", dest="ver")
+    ap.add_argument("-w", "--write-recipe")
+    ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--only")
+    ap.add_argument("-n", "--bioconda-name")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__.strip()); return 0
+    OFFLINE = a.offline
+    root = sh("git", "rev-parse", "--show-toplevel", cwd=a.dir)
+    if not root:
+        print(f"relcheck: {a.dir} is not in a git repository", file=sys.stderr); return 2
+    targets = set((a.only or "crates,github,bioconda").split(","))
+    ri = repo_info(root)
+    rust = rust_info(root) if os.path.exists(os.path.join(root, "Cargo.toml")) else None
+    py = None if rust else python_info(root)
+    if os.path.exists(os.path.join(root, "Cargo.toml")) and not rust:
+        print("relcheck: Cargo.toml found but `cargo metadata` failed (is cargo on PATH?)", file=sys.stderr); return 2
+    if not rust and not py:
+        print("relcheck: no Cargo.toml or pyproject.toml; only Rust and Python packages are understood", file=sys.stderr); return 2
+    rep = Report()
+    if rust:
+        main_pkg = next((p for p in rust["packages"] if p["name"] in rust["bins"] or any(
+            "bin" in t["kind"] for t in p["targets"])), rust["packages"][0])
+        name, cur, desc = main_pkg["name"], main_pkg["version"], main_pkg.get("description")
+        lic, home = main_pkg.get("license") or "", main_pkg.get("repository") or main_pkg.get("homepage") or ""
+        kind = "Rust " + ("workspace" if len(rust["packages"]) > 1 else "crate")
+    else:
+        name, cur, desc, lic = py["name"], py["version"], py["description"], py["license"] or ""
+        home = py["urls"].get("Homepage") or py["urls"].get("Repository") or ""
+        kind = "Python package"
+        if "version" in py["dynamic"]:
+            NOTES.add("version is dynamic in pyproject.toml; pass -V VERSION")
+    version = a.ver or cur
+    if not version:
+        print("relcheck: couldn't find the version; pass -V VERSION", file=sys.stderr); return 2
+    tag = ("v" if ri["vprefix"] else "") + version
+    if not home and ri["slug"]:
+        home = "https://github.com/%s/%s" % ri["slug"]
+
+    print(bold(f"{name} {version}") + dim(f"  ({kind}, {root})"))
+    rep.section("repository")
+    rep.info(f"branch {ri['branch']}, origin {ri['remote'] or 'none'}; tags look like "
+             f"{'v1.2.3' if ri['vprefix'] else '1.2.3'} -> will tag {tag}")
+    if ri["dirty"]:
+        rep.warn(f"{len(ri['dirty'])} uncommitted change(s): " + ", ".join(l[3:] for l in ri["dirty"][:5]))
+    else:
+        rep.ok("working tree clean")
+    if ri["ahead"]:
+        rep.warn(f"{ri['ahead']} commit(s) not pushed to {ri['upstream']}")
+    if a.ver and cur and a.ver != cur:
+        rep.info(f"package says {cur}; planning for {a.ver}")
+    elif cur in [t.lstrip("v") for t in ri["tags"]] and tag in ri["tags"]:
+        rep.info(f"{tag} is already tagged here")
+
+    crates_ok, gh, bc = [], {}, {"name": name}
+    if "crates" in targets:
+        if rust:
+            crates_ok = check_crates(rep, ri, rust, version)
+        else:
+            rep.section("crates.io"); rep.info("not a Rust crate (PyPI would be the equivalent: python -m build && twine upload dist/*)")
+    if "github" in targets or "bioconda" in targets:
+        if "github" in targets:
+            gh = check_github(rep, ri, rust, tag, version)
+        else:
+            gh = {"slug": "%s/%s" % ri["slug"] if ri["slug"] else None}
+            if gh["slug"]:
+                gh["tag_on_github"] = isinstance(get(f"https://api.github.com/repos/{gh['slug']}/git/ref/tags/{tag}"), dict)
+    if "bioconda" in targets:
+        bc = check_bioconda(rep, ri, rust, py, a.bioconda_name or name, version, tag, gh)
+    wrote = None
+    if a.write_recipe:
+        meta, build = draft_recipe(rust, py, bc["name"], version, tag, gh, bc, desc, lic, home)
+        os.makedirs(a.write_recipe, exist_ok=True)
+        open(os.path.join(a.write_recipe, "meta.yaml"), "w").write(meta)
+        if build:
+            bp = os.path.join(a.write_recipe, "build.sh")
+            open(bp, "w").write(build); os.chmod(bp, 0o755)
+        wrote = a.write_recipe
+        print(f"\n  {OK} draft recipe written to {wrote}/ (meta.yaml{', build.sh' if build else ''}); read it before submitting")
+
+    for n in sorted(NOTES):
+        print(f"\n{WARN} {n}")
+    if rep.blockers:
+        print("\n" + bold(c("31", "Fix first")))
+        for t, b in rep.blockers:
+            print(f"  {BAD} [{t}] {b}")
+    steps = plan(ri, rust, py, version, tag, targets, crates_ok, gh, bc, wrote)
+    if steps:
+        print("\n" + bold("Steps") + dim(f"  (run from {root}; in this order: tag first, the bioconda source is the tag tarball)"))
+        k = 0
+        for title, cmds in steps:
+            print(f"\n  {bold(title)}")
+            for cmd in cmds:
+                if cmd.startswith("#"):
+                    print("     " + dim(cmd))
+                else:
+                    k += 1
+                    print(f"  {k:>2}. {cmd}")
+    elif not rep.blockers:
+        print("\n" + OK + f" {name} {version} is released everywhere checked.")
+    return 1 if rep.blockers else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

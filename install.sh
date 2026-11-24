@@ -90,7 +90,7 @@ for d in "${DEPS[@]}"; do
   fi
 done
 command -v bsub >/dev/null || echo "  bsub    MISSING  (LSF; bq, bdone, bjstat and bjpick need it — are you on the cluster?)"
-command -v python3 >/dev/null || echo "  python3 MISSING  (bjstat, bjpick, tol)"
+command -v python3 >/dev/null || echo "  python3 MISSING  (bjstat, bjpick, tol, relcheck)"
 if [[ $(fzf --version 2>/dev/null | cut -d' ' -f1) =~ ^0\.([0-9]+) ]] && (( BASH_REMATCH[1] < 56 )); then
   echo "  fzf is older than 0.56; bjpick's live preview needs 0.56+. Run ./install.sh --deps after removing the old one from PATH, or put $PREFIX first."
 fi

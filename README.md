@@ -1,9 +1,10 @@
 # farm-tools
 
 Small terminal tools for working on the LSF farm over ssh. They are
-plain bash and Python 3 scripts (standard library only), they call no web services, and they only
-read: none kills, moves or deletes anything. The one exception is `bq`, which submits the job you
-give it.
+plain bash and Python 3 scripts (standard library only), they call no web services (except
+`relcheck`, which looks things up on crates.io, GitHub and bioconda, with no login needed), and they
+only read: none kills, moves or deletes anything. The one exception is `bq`, which submits the job
+you give it.
 
 The most useful one is probably **the jobs picker, `bjpick`**: a pop-up list of your jobs where the
 highlighted job shows a live card (time against its limit, memory and CPU against what it asked for,
@@ -74,6 +75,14 @@ k-mer stats and the paths to them. `tol -f ID hap1` prints the current release F
 species directory, `tol -k ID` the k-mer directory. *Note: unlike the other tools this one is
 specific to Sanger's Tree of Life data layout (`/data/tol/data/<project>/<group>/<Genus_species>`)
 and is only useful there. `TOL_DATA` overrides the root if it moves.*
+
+**`relcheck`** is for people who write tools: run it in a Rust or Python git repo and it works out
+what it would take to release it to crates.io, as GitHub release binaries, and on bioconda. It says
+what is already published where, what blocks a release (a version that wasn't bumped, a dependency
+crates.io won't accept, a name already taken on bioconda by a different tool, no licence file), and
+then prints the exact commands in the order to run them. `relcheck -V 0.4.0` plans a new version,
+`-w DIR` drafts a bioconda recipe (with the source tarball's sha256 once the tag is pushed), and
+`-n NAME` tries another bioconda name. It only reads; you run the commands.
 
 ## Examples
 
@@ -172,6 +181,28 @@ $ figs show plots/pca.png  # draw one figure right here
 **Read Markdown with `md`:** `md README.md`, `md -w notes.md` (re-renders whenever it changes), or
 `some-command | md`.
 
+**Plan a release with `relcheck`** (trimmed, path shortened):
+
+```
+$ relcheck -V 0.4.0
+tidk 0.4.0  (Rust crate, ~/telomeric-identifier)
+crates.io
+  ✓ tidk: crates.io has 0.3.3; 0.4.0 would be new (owners: Euphrasiologist)
+GitHub release
+  ✓ cargo-dist release workflow: .github/workflows/release.yml (pinned 0.30.2, you have 0.34.0)
+bioconda
+  ✓ recipe recipes/tidk exists (version 0.3.3; built package 0.3.3)
+  · native libraries in Cargo.lock -> recipe needs host: openssl, build: cmake
+Steps
+   1. sed -i 's/^version = "0.3.3"/version = "0.4.0"/' Cargo.toml   # and Cargo.lock: cargo update -p tidk
+   ...
+   4. git tag v0.4.0
+   5. git push origin main v0.4.0
+   6. d=$(mktemp -d) && git clone --depth 1 --branch v0.4.0 … $d && cd $d
+   7. cargo publish --dry-run
+   ...
+```
+
 **Find a species' data with `tol`:**
 
 ```console
@@ -207,6 +238,7 @@ farm's head nodes.
 | `figs` | `fzf`, `fd`, and `chafa` and/or `viu`; `pdftoppm` for PDFs, `inkscape` or ImageMagick for SVGs |
 | `md` | `mdcat` (or Python `rich` with `md -r`) |
 | `tol` | Python 3; access to the Sanger ToL data tree |
+| `relcheck` | Python 3, git, internet access; `cargo` for Rust repos; `gh` and `dist` (cargo-dist) to run the steps it prints |
 
 ## Other LSF sites
 

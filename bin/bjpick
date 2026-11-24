@@ -84,7 +84,7 @@ LIVE="BJSTAT_COLOR=1 bjstat {1} --peek \$FZF_PREVIEW_LINES \$FZF_PREVIEW_COLUMNS
 CARD="BJSTAT_COLOR=1 bjstat {1} --compact --no-files"
 list | fzf --ansi --no-sort --reverse --track --delimiter=$'\t' --with-nth=2 \
     --listen-unsafe \
-    --header="● = from $(basename "$HERE") · preview: card + live logs · enter follow full-screen · ctrl-k card only / ctrl-l card+logs · alt-enter full card · esc close" \
+    --header=$'enter follow logs · alt-enter full card · esc close\nctrl-k card only · ctrl-l card+logs\nctrl-r reload · ctrl-/ hide preview · ● = from '"$(basename "$HERE")" \
     --preview="$LIVE" \
     --preview-window='down,70%,border-top,wrap' \
     --bind="start:execute-silent(setsid '$SELF' __ticker \$PPID >/dev/null 2>&1 < /dev/null &)" \
